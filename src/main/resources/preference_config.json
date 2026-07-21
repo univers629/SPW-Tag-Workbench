@@ -1,0 +1,38 @@
+{
+  "configs": [
+    {
+      "title": "音乐标签工作台",
+      "config": "tag-workbench.json",
+      "preferences": [
+        {
+          "key": "library.folder",
+          "type": "edittext",
+          "title": "SPW 音乐文件夹",
+          "summary": "填写 SPW 中使用的歌曲文件夹；打开工作台时自动扫描",
+          "default_value": ""
+        },
+        {
+          "type": "button",
+          "title": "选择 SPW 音乐文件夹",
+          "summary": "从文件夹选择器保存音乐库目录",
+          "arrow_type": "arrow",
+          "on_click": "com.smallsinger.spw.tags.TagWorkbenchPlugin.chooseLibraryFolder"
+        },
+        {
+          "type": "button",
+          "title": "打开标签工作台",
+          "summary": "自动跟随当前播放歌曲，也可选择文件批量匹配、编辑和写入标签",
+          "arrow_type": "arrow",
+          "on_click": "com.smallsinger.spw.tags.TagWorkbenchPlugin.openWorkbench"
+        },
+        {
+          "type": "button",
+          "title": "开源项目",
+          "summary": "查看源代码、使用说明与问题反馈",
+          "arrow_type": "arrow",
+          "on_click": "com.smallsinger.spw.tags.TagWorkbenchPlugin.openSourcePage"
+        }
+      ]
+    }
+  ]
+}
