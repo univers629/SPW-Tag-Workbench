@@ -2,6 +2,10 @@
 
 适用于 Salt Player for Windows（SPW）的音乐标签工作台插件，可批量读取、在线匹配、预览、编辑并写入本地音乐标签。
 
+## 界面展示
+
+<img width="986" height="673" alt="Quicker_20260721_174022" src="https://github.com/user-attachments/assets/7a5c6a64-7cc5-4f50-b15a-54cf5f460ec3" />
+
 ## 功能
 
 - 支持标题、艺术家、专辑、年份、音轨号、碟号、风格、专辑艺术家、作曲家、作词家、注释、歌词与封面。
