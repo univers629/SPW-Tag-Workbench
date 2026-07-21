@@ -17,6 +17,9 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 final class TagWorkbenchWindow extends JFrame {
     private static final Color BG = new Color(246, 247, 249), CARD = Color.WHITE;
@@ -101,7 +104,7 @@ final class TagWorkbenchWindow extends JFrame {
         setCursor(Cursor.getDefaultCursor()); if(model.getRowCount()>0&&table.getSelectedRow()<0)table.setRowSelectionInterval(0,0); status.setText("已载入 "+model.getRowCount()+" 首歌曲");
     }
 
-    void openLibraryFolder(File folder){if(folder==null||!folder.isDirectory()||model.getRowCount()>0)return;status.setText("正在扫描音乐文件夹："+folder.getAbsolutePath());new Thread(()->{int[] count={0};try(var paths=Files.walk(folder.toPath())){paths.filter(Files::isRegularFile).filter(path->isAudio(path.getFileName().toString())).forEach(path->{try{AudioTagData data=AudioTagService.read(path.toFile());SwingUtilities.invokeLater(()->model.add(data));count[0]++;}catch(Exception ignored){}});SwingUtilities.invokeLater(()->{status.setText("音乐文件夹扫描完成："+count[0]+" 首");if(model.getRowCount()>0&&table.getSelectedRow()<0)table.setRowSelectionInterval(0,0);});}catch(Exception ex){SwingUtilities.invokeLater(()->status.setText("音乐文件夹扫描失败："+ex.getMessage()));}},"library-scan").start();}
+    void openLibraryFolder(File folder){if(folder==null||!folder.isDirectory()||model.getRowCount()>0)return;status.setText("正在多线程扫描音乐文件夹："+folder.getAbsolutePath());new Thread(()->{try{List<Path> audioFiles;try(var paths=Files.walk(folder.toPath())){audioFiles=paths.filter(Files::isRegularFile).filter(path->isAudio(path.getFileName().toString())).sorted().toList();}int workers=Math.max(2,Math.min(8,Runtime.getRuntime().availableProcessors()));List<AudioTagData> loaded=new ArrayList<>();try(var pool=Executors.newFixedThreadPool(workers)){List<Future<AudioTagData>> tasks=new ArrayList<>();for(Path path:audioFiles)tasks.add(pool.submit(()->{try{return AudioTagService.read(path.toFile());}catch(Exception ignored){return null;}}));for(Future<AudioTagData> task:tasks){AudioTagData data=task.get();if(data!=null)loaded.add(data);}}SwingUtilities.invokeLater(()->{for(AudioTagData data:loaded)model.add(data);status.setText("多线程扫描完成："+loaded.size()+" 首（"+workers+" 个线程）");if(model.getRowCount()>0&&table.getSelectedRow()<0)table.setRowSelectionInterval(0,0);});}catch(Exception ex){SwingUtilities.invokeLater(()->status.setText("音乐文件夹扫描失败："+ex.getMessage()));}},"library-scan").start();}
     private static boolean isAudio(String name){String n=name.toLowerCase(java.util.Locale.ROOT);return n.endsWith(".mp3")||n.endsWith(".flac")||n.endsWith(".m4a")||n.endsWith(".ogg")||n.endsWith(".opus")||n.endsWith(".wav")||n.endsWith(".wma");}
     void openPlaybackFile(File file){if(!followPlayback.isSelected()||file==null||!file.isFile())return;sorter.setRowFilter(null);listSearch.setText("");for(int i=0;i<model.items.size();i++)if(model.items.get(i).file().equals(file)){selectModelRow(i);return;}try{model.add(AudioTagService.read(file));selectModelRow(model.getRowCount()-1);status.setText("已跟随当前播放："+file.getName());}catch(Exception ex){status.setText("无法载入当前播放歌曲："+ex.getMessage());}}
 
