@@ -33,7 +33,7 @@ tasks.jar {
             "Plugin-Description" to "批量预览、编辑并写入本地音乐标签",
             "Plugin-Version" to pluginVersion,
             "Plugin-Provider" to "smallsinger",
-            "Plugin-Website" to "https://github.com/univers629/SPW-Tag-Workbench",
+            "Plugin-Open-Source-Url" to "https://github.com/univers629/SPW-Tag-Workbench",
             "Plugin-License" to "MIT",
             "Plugin-Has-Config" to "true"
         )
