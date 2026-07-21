@@ -26,6 +26,18 @@
 
 本项目是非官方社区插件。在线数据来自相应音乐服务，仅供个人音乐文件整理使用，请遵守当地法律及各服务条款。
 
+## 致谢
+
+本项目的设计与实现参考了以下优秀开源项目，感谢各项目作者与贡献者：
+
+- [spw-workshop-api](https://github.com/Moriafly/spw-workshop-api)：提供 SPW 创意工坊插件接口、示例与开发参考。
+- [SaltUI](https://github.com/Moriafly/SaltUI)：提供 Salt 系列界面风格与交互设计参考。
+- [Lyrico](https://github.com/Replica0110/Lyrico)：提供音乐信息匹配、歌词处理与工作流设计参考。
+- [Lyrico-Plugins](https://github.com/Replica0110/Lyrico-Plugins)：提供多音乐源搜索插件的实现参考。
+- [LDDC](https://github.com/chenmozhijin/LDDC)：提供歌词匹配及逐字歌词处理思路参考。
+
+以上项目的名称与链接仅用于致谢，不代表其作者对本项目提供官方支持或背书。
+
 ## 许可证
 
 [MIT License](LICENSE)
