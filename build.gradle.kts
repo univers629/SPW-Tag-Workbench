@@ -34,7 +34,7 @@ tasks.jar {
             "Plugin-Version" to pluginVersion,
             "Plugin-Provider" to "smallsinger",
             "Plugin-Open-Source-Url" to "https://github.com/univers629/SPW-Tag-Workbench",
-            "Plugin-License" to "MIT",
+            "Plugin-License" to "GPL-3.0-only",
             "Plugin-Has-Config" to "true"
         )
     }

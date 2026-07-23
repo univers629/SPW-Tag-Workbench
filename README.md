@@ -36,12 +36,12 @@
 
 - [spw-workshop-api](https://github.com/Moriafly/spw-workshop-api)：提供 SPW 创意工坊插件接口、示例与开发参考。
 - [SaltUI](https://github.com/Moriafly/SaltUI)：提供 Salt 系列界面风格与交互设计参考。
-- [Lyrico](https://github.com/Replica0110/Lyrico)：提供音乐信息匹配、歌词处理与工作流设计参考。
+- [Lyrico](https://github.com/Replica0110/Lyrico)（Apache-2.0）：提供音乐信息匹配、歌词处理与工作流设计参考。
 - [Lyrico-Plugins](https://github.com/Replica0110/Lyrico-Plugins)：提供多音乐源搜索插件的实现参考。
-- [LDDC](https://github.com/chenmozhijin/LDDC)：提供歌词匹配及逐字歌词处理思路参考。
+- [LDDC](https://github.com/chenmozhijin/LDDC)（GPL-3.0-only）：提供歌词匹配及逐字歌词处理实现参考；本项目按其强 copyleft 要求采用 GPL-3.0-only。
 
 以上项目的名称与链接仅用于致谢，不代表其作者对本项目提供官方支持或背书。
 
 ## 许可证
 
-[MIT License](LICENSE)
+[GNU General Public License v3.0 only](LICENSE)。第三方组件及参考项目的许可证声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
