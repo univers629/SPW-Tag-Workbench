@@ -1,8 +1,25 @@
 .gradle/
+.kotlin/
 build/
 out/
 .idea/
+.vscode/
+.fleet/
+.settings/
 *.iml
+.classpath
+.project
+local.properties
+.env
+.env.*
+!.env.example
 *.log
+*.tmp
+*.bak
+hs_err_pid*
+replay_pid*
 .DS_Store
 Thumbs.db
+
+# 曾由 GitHub Desktop 误建在项目内部的重复仓库
+univers629/

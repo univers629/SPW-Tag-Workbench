@@ -14,17 +14,19 @@ final class AudioTagService {
 
     static AudioTagData read(File file) throws Exception {
         AudioFile audio = AudioFileIO.read(file);
+        var header=audio.getAudioHeader();
+        String duration=formatDuration(header.getTrackLength()),bitDepth=header.getBitsPerSample()>0?header.getBitsPerSample()+" bit":"",bitrate=header.getBitRate()==null?"":header.getBitRate()+" kbps";
         Tag tag = audio.getTag();
         if (tag == null) {
-            return new AudioTagData(file, "", "", "", "", "", "", "", "", "", "", "", "", null);
+            return new AudioTagData(file, "", "", "", "", "", "", "", "", "", "", "", "", null,duration,bitDepth,bitrate);
         }
         Artwork artwork = tag.getFirstArtwork();
         return new AudioTagData(file,
                 value(tag, FieldKey.TITLE), value(tag, FieldKey.ARTIST), value(tag, FieldKey.ALBUM),
-                value(tag, FieldKey.ALBUM_ARTIST), value(tag, FieldKey.LYRICIST), value(tag, FieldKey.COMPOSER),
-                value(tag, FieldKey.YEAR), value(tag, FieldKey.TRACK), value(tag, FieldKey.DISC_NO),
-                value(tag, FieldKey.GENRE), value(tag, FieldKey.LYRICS), value(tag, FieldKey.COMMENT),
-                artwork == null ? null : artwork.getBinaryData());
+                optionalValue(tag, FieldKey.ALBUM_ARTIST), optionalValue(tag, FieldKey.LYRICIST), optionalValue(tag, FieldKey.COMPOSER),
+                optionalValue(tag, FieldKey.YEAR), optionalValue(tag, FieldKey.TRACK), optionalValue(tag, FieldKey.DISC_NO),
+                optionalValue(tag, FieldKey.GENRE), value(tag, FieldKey.LYRICS), optionalValue(tag, FieldKey.COMMENT),
+                artwork == null ? null : artwork.getBinaryData(),duration,bitDepth,bitrate);
     }
 
     static void write(AudioTagData data) throws Exception {
@@ -56,8 +58,13 @@ final class AudioTagService {
         String value = tag.getFirst(key);
         return value == null ? "" : value;
     }
+    private static String optionalValue(Tag tag, FieldKey key) {
+        String value=value(tag,key).trim();
+        return value.matches("(?i)^(?:0+(?:/0+)?|unknown|null|n/a|-)$")?"":value;
+    }
 
     private static void set(Tag tag, FieldKey key, String value) throws Exception {
         tag.setField(key, value == null ? "" : value);
     }
+    private static String formatDuration(int seconds){return String.format(java.util.Locale.ROOT,"%d:%02d",seconds/60,seconds%60);}
 }

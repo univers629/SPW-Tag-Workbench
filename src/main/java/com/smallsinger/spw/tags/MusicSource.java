@@ -6,5 +6,5 @@ interface MusicSource {
 
     record Result(String title, String artist, String album, String albumArtist, String year,
                   String track, String disc, String genre, String composer, String lyricist,
-                  String lyrics, String comment, byte[] cover) {}
+                  long durationMillis, String lyrics, String comment, byte[] cover) {}
 }

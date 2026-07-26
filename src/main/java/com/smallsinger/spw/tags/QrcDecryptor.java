@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: 2026 univers629
+// SPDX-FileCopyrightText: Lyrico-Plugins contributors
+// SPDX-License-Identifier: GPL-3.0-only
+package com.smallsinger.spw.tags;
+
+final class QrcDecryptor {
+    private static final int[][] SBOX={
+        {14,4,13,1,2,15,11,8,3,10,6,12,5,9,0,7,0,15,7,4,14,2,13,1,10,6,12,11,9,5,3,8,4,1,14,8,13,6,2,11,15,12,9,7,3,10,5,0,15,12,8,2,4,9,1,7,5,11,3,14,10,0,6,13},
+        {15,1,8,14,6,11,3,4,9,7,2,13,12,0,5,10,3,13,4,7,15,2,8,15,12,0,1,10,6,9,11,5,0,14,7,11,10,4,13,1,5,8,12,6,9,3,2,15,13,8,10,1,3,15,4,2,11,6,7,12,0,5,14,9},
+        {10,0,9,14,6,3,15,5,1,13,12,7,11,4,2,8,13,7,0,9,3,4,6,10,2,8,5,14,12,11,15,1,13,6,4,9,8,15,3,0,11,1,2,12,5,10,14,7,1,10,13,0,6,9,8,7,4,15,14,3,11,5,2,12},
+        {7,13,14,3,0,6,9,10,1,2,8,5,11,12,4,15,13,8,11,5,6,15,0,3,4,7,2,12,1,10,14,9,10,6,9,0,12,11,7,13,15,1,3,14,5,2,8,4,3,15,0,6,10,10,13,8,9,4,5,11,12,7,2,14},
+        {2,12,4,1,7,10,11,6,8,5,3,15,13,0,14,9,14,11,2,12,4,7,13,1,5,0,15,10,3,9,8,6,4,2,1,11,10,13,7,8,15,9,12,5,6,3,0,14,11,8,12,7,1,14,2,13,6,15,0,9,10,4,5,3},
+        {12,1,10,15,9,2,6,8,0,13,3,4,14,7,5,11,10,15,4,2,7,12,9,5,6,1,13,14,0,11,3,8,9,14,15,5,2,8,12,3,7,0,4,10,1,13,11,6,4,3,2,12,9,5,15,10,11,14,1,7,6,0,8,13},
+        {4,11,2,14,15,0,8,13,3,12,9,7,5,10,6,1,13,0,11,7,4,9,1,10,14,3,5,12,2,15,8,6,1,4,11,13,12,3,7,14,10,15,6,8,0,5,9,2,6,11,13,8,1,4,10,7,9,5,0,15,14,2,3,12},
+        {13,2,8,4,6,15,11,1,10,9,3,14,5,0,12,7,1,15,13,8,10,3,7,4,12,5,6,11,0,14,9,2,7,11,4,1,9,12,14,2,0,6,10,13,15,3,5,8,2,1,14,7,4,10,8,13,15,12,9,0,3,5,6,11}
+    };
+    private QrcDecryptor(){}
+    static byte[] decrypt(byte[] input,byte[] key){
+        byte[][][] schedules={keySchedule(slice(key,16),true),keySchedule(slice(key,8),false),keySchedule(slice(key,0),true)};
+        byte[] out=new byte[input.length];for(int i=0;i+8<=input.length;i+=8){byte[] block=java.util.Arrays.copyOfRange(input,i,i+8);for(byte[][] schedule:schedules)block=cryptBlock(block,schedule);System.arraycopy(block,0,out,i,8);}return out;
+    }
+    private static byte[] slice(byte[] key,int start){return java.util.Arrays.copyOfRange(key,start,start+8);}
+    private static int bitnum(byte[] bytes,int b,int c){int index=(b/32)*4+3-(b%32)/8;if(index>=bytes.length)return 0;int bit=((bytes[index]&255) >>> (7-(b%8)))&1;return bit<<c;}
+    private static int bitnumIntr(int value,int b,int c){return ((value >>> (31-b))&1)<<c;}
+    private static int bitnumIntl(int value,int b,int c){return ((value<<b)&0x80000000)>>>c;}
+    private static int sboxBit(int value){return (value&32)|((value&31)>>>1)|((value&1)<<4);}
+    private static int[] initial(byte[] in){int s0=bitnum(in,57,31)|bitnum(in,49,30)|bitnum(in,41,29)|bitnum(in,33,28)|bitnum(in,25,27)|bitnum(in,17,26)|bitnum(in,9,25)|bitnum(in,1,24)|bitnum(in,59,23)|bitnum(in,51,22)|bitnum(in,43,21)|bitnum(in,35,20)|bitnum(in,27,19)|bitnum(in,19,18)|bitnum(in,11,17)|bitnum(in,3,16)|bitnum(in,61,15)|bitnum(in,53,14)|bitnum(in,45,13)|bitnum(in,37,12)|bitnum(in,29,11)|bitnum(in,21,10)|bitnum(in,13,9)|bitnum(in,5,8)|bitnum(in,63,7)|bitnum(in,55,6)|bitnum(in,47,5)|bitnum(in,39,4)|bitnum(in,31,3)|bitnum(in,23,2)|bitnum(in,15,1)|bitnum(in,7,0);int s1=bitnum(in,56,31)|bitnum(in,48,30)|bitnum(in,40,29)|bitnum(in,32,28)|bitnum(in,24,27)|bitnum(in,16,26)|bitnum(in,8,25)|bitnum(in,0,24)|bitnum(in,58,23)|bitnum(in,50,22)|bitnum(in,42,21)|bitnum(in,34,20)|bitnum(in,26,19)|bitnum(in,18,18)|bitnum(in,10,17)|bitnum(in,2,16)|bitnum(in,60,15)|bitnum(in,52,14)|bitnum(in,44,13)|bitnum(in,36,12)|bitnum(in,28,11)|bitnum(in,20,10)|bitnum(in,12,9)|bitnum(in,4,8)|bitnum(in,62,7)|bitnum(in,54,6)|bitnum(in,46,5)|bitnum(in,38,4)|bitnum(in,30,3)|bitnum(in,22,2)|bitnum(in,14,1)|bitnum(in,6,0);return new int[]{s0,s1};}
+    private static byte[] inverse(int s0,int s1){int[][] p={{4,4,12,12,20,20,28,28},{5,5,13,13,21,21,29,29},{6,6,14,14,22,22,30,30},{7,7,15,15,23,23,31,31},{0,0,8,8,16,16,24,24},{1,1,9,9,17,17,25,25},{2,2,10,10,18,18,26,26},{3,3,11,11,19,19,27,27}};byte[] out=new byte[8];for(int i=0;i<8;i++){int v=0;for(int j=0;j<8;j++)v|=bitnumIntr(j%2==0?s1:s0,p[i][j],7-j);out[i]=(byte)v;}return out;}
+    private static int f(int state,byte[] key){int t1=bitnumIntl(state,31,0)|((state&0xf0000000)>>>1)|bitnumIntl(state,4,5)|bitnumIntl(state,3,6)|((state&0x0f000000)>>>3)|bitnumIntl(state,8,11)|bitnumIntl(state,7,12)|((state&0x00f00000)>>>5)|bitnumIntl(state,12,17)|bitnumIntl(state,11,18)|((state&0x000f0000)>>>7)|bitnumIntl(state,16,23);int t2=bitnumIntl(state,15,0)|((state&0x0000f000)<<15)|bitnumIntl(state,20,5)|bitnumIntl(state,19,6)|((state&0x00000f00)<<13)|bitnumIntl(state,24,11)|bitnumIntl(state,23,12)|((state&0x000000f0)<<11)|bitnumIntl(state,28,17)|bitnumIntl(state,27,18)|((state&15)<<9)|bitnumIntl(state,0,23);int[] l={(t1>>>24)&255,(t1>>>16)&255,(t1>>>8)&255,(t2>>>24)&255,(t2>>>16)&255,(t2>>>8)&255};for(int i=0;i<6;i++)l[i]^=key[i]&255;int r=(SBOX[0][sboxBit(l[0]>>>2)]<<28)|(SBOX[1][sboxBit(((l[0]&3)<<4)|(l[1]>>>4))]<<24)|(SBOX[2][sboxBit(((l[1]&15)<<2)|(l[2]>>>6))]<<20)|(SBOX[3][sboxBit(l[2]&63)]<<16)|(SBOX[4][sboxBit(l[3]>>>2)]<<12)|(SBOX[5][sboxBit(((l[3]&3)<<4)|(l[4]>>>4))]<<8)|(SBOX[6][sboxBit(((l[4]&15)<<2)|(l[5]>>>6))]<<4)|SBOX[7][sboxBit(l[5]&63)];int[] order={15,6,19,20,28,11,27,16,0,14,22,25,4,17,30,9,1,7,23,13,31,26,2,8,18,12,29,5,21,10,3,24};int out=0;for(int i=0;i<32;i++)out|=bitnumIntl(r,order[i],i);return out;}
+    private static byte[][] keySchedule(byte[] key,boolean decrypt){byte[][] schedule=new byte[16][6];int[] shifts={1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1},pc={56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35},pd={62,54,46,38,30,22,14,6,61,53,45,37,29,21,13,5,60,52,44,36,28,20,12,4,27,19,11,3},kc={13,16,10,23,0,4,2,27,14,5,20,9,22,18,11,3,25,7,15,6,26,19,12,1,40,51,30,36,46,54,29,39,50,44,32,47,43,48,38,55,33,52,45,41,49,35,28,31};int c=0,d=0;for(int i=0;i<28;i++){c|=bitnum(key,pc[i],31-i);d|=bitnum(key,pd[i],31-i);}for(int i=0;i<16;i++){c=((c<<shifts[i])|(c>>>(28-shifts[i])))&0xfffffff0;d=((d<<shifts[i])|(d>>>(28-shifts[i])))&0xfffffff0;int idx=decrypt?15-i:i;for(int j=0;j<24;j++)schedule[idx][j/8]|=(byte)bitnumIntr(c,kc[j],7-j%8);for(int j=24;j<48;j++)schedule[idx][j/8]|=(byte)bitnumIntr(d,kc[j]-27,7-j%8);}return schedule;}
+    private static byte[] cryptBlock(byte[] input,byte[][] schedule){int[] s=initial(input);int s0=s[0],s1=s[1];for(int i=0;i<15;i++){int previous=s1;s1=f(s1,schedule[i])^s0;s0=previous;}s0=f(s1,schedule[15])^s0;return inverse(s0,s1);}
+}

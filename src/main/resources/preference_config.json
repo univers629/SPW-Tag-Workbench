@@ -5,16 +5,16 @@
       "config": "tag-workbench.json",
       "preferences": [
         {
-          "key": "library.folder",
-          "type": "edittext",
-          "title": "SPW 音乐文件夹",
-          "summary": "填写 SPW 中使用的歌曲文件夹；打开工作台时自动扫描",
-          "default_value": ""
+          "key": "matching.skip_complete",
+          "type": "switch",
+          "title": "跳过已有完整标签的歌曲",
+          "summary": "开启后，标题、艺术家、专辑、封面和歌词均不为空的歌曲不会再参与标签源匹配，避免覆盖现有内容",
+          "default_value": false
         },
         {
           "type": "button",
-          "title": "选择 SPW 音乐文件夹",
-          "summary": "从文件夹选择器保存音乐库目录",
+          "title": "SPW 音乐文件夹",
+          "summary": "选择并管理一个或多个音乐目录；打开工作台时自动扫描",
           "arrow_type": "arrow",
           "on_click": "com.smallsinger.spw.tags.TagWorkbenchPlugin.chooseLibraryFolder"
         },

@@ -1,7 +1,7 @@
 package com.smallsinger.spw.tags;
 
+import com.xuncorp.spw.workshop.api.WorkshopApi;
 import javax.swing.SwingUtilities;
-import java.io.File;
 
 public final class TagWorkbenchLauncher {
     private static TagWorkbenchWindow window;
@@ -9,13 +9,24 @@ public final class TagWorkbenchLauncher {
 
     public static void open() {
         SwingUtilities.invokeLater(() -> {
-            if (window == null || !window.isDisplayable()) window = new TagWorkbenchWindow();
-            window.setVisible(true);
-            window.toFront();
-            File library = TagWorkbenchPlugin.configuredMusicFolder();
-            if (library != null) window.openLibraryFolder(library);
-            File current = CurrentMediaExtension.currentFile();
-            if (current != null) window.openPlaybackFile(current);
+            try {
+                if (window == null || !window.isDisplayable())
+                    window = TagWorkbenchWindow.create();
+                window.setVisible(true);
+                window.toFront();
+                window.preloadPersistentViews();
+                window.openLibraryFolders(TagWorkbenchPlugin.configuredMusicFolders());
+            } catch (Throwable error) {
+                TagWorkbenchWindow failed = window;
+                window = null;
+                if (failed != null) failed.dispose();
+                WorkshopApi.ui().toast(
+                    "标签工作台打开失败：" +
+                        (error.getMessage() == null
+                             ? error.getClass().getSimpleName()
+                             : error.getMessage()),
+                    WorkshopApi.Ui.ToastType.Error);
+            }
         });
     }
 
@@ -30,5 +41,9 @@ public final class TagWorkbenchLauncher {
             if (window != null) window.dispose();
             window = null;
         });
+    }
+
+    static void onWindowDisposed(TagWorkbenchWindow disposed) {
+        if (window == disposed) window = null;
     }
 }

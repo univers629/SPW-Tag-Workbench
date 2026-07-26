@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "com.smallsinger.spw.tags"
-version = "0.4.0"
+version = "1.0.0"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21
@@ -13,9 +13,13 @@ java {
 dependencies {
     compileOnly("com.github.Moriafly:spw-workshop-api:0.1.0-dev14")
     compileOnly("org.jetbrains.kotlin:kotlin-stdlib:2.2.0")
+    compileOnly("net.java.dev.jna:jna:5.18.1")
     annotationProcessor("org.pf4j:pf4j:3.12.0")
     implementation("net.jthink:jaudiotagger:3.0.1")
-    implementation("com.google.code.gson:gson:2.13.2")
+    implementation("com.google.code.gson:gson:2.13.2") {
+        exclude(group = "com.google.errorprone",
+                module = "error_prone_annotations")
+    }
     implementation("com.formdev:flatlaf:3.6.2")
 }
 
@@ -30,7 +34,7 @@ tasks.jar {
             "Plugin-Class" to pluginClass,
             "Plugin-Id" to pluginId,
             "Plugin-Name" to pluginName,
-            "Plugin-Description" to "批量预览、编辑并写入本地音乐标签",
+            "Plugin-Description" to "在线批量匹配封面和逐字歌词，查看歌曲频谱图，编辑、预览音乐标签信息",
             "Plugin-Version" to pluginVersion,
             "Plugin-Provider" to "smallsinger",
             "Plugin-Open-Source-Url" to "https://github.com/univers629/SPW-Tag-Workbench",
@@ -48,10 +52,10 @@ tasks.register<Jar>("plugin") {
     into("classes") { with(tasks.jar.get()) }
     dependsOn(tasks.jar, configurations.runtimeClasspath)
     into("lib") {
-        from(configurations.runtimeClasspath.get().filter {
-            it.name.startsWith("jaudiotagger-") || it.name.startsWith("gson-") || it.name.startsWith("flatlaf-")
-        })
+        from(configurations.runtimeClasspath)
     }
+    from("LICENSE")
+    from("THIRD_PARTY_NOTICES.md")
     archiveExtension.set("zip")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
