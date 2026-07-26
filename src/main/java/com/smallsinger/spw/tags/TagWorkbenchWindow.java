@@ -6,6 +6,7 @@ import com.formdev.flatlaf.FlatLightLaf;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.File;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -44,6 +45,26 @@ import javax.swing.text.JTextComponent;
 final class TagWorkbenchWindow extends JFrame {
   private static final Color ACCENT = new Color(35, 109, 246),
                              SUB = new Color(102, 110, 122);
+  private static final String[] FONT_UI_KEYS = {
+      "Label.font", "Button.font", "ToggleButton.font", "CheckBox.font",
+      "RadioButton.font", "ComboBox.font", "Menu.font", "MenuItem.font",
+      "CheckBoxMenuItem.font", "RadioButtonMenuItem.font", "TextField.font",
+      "FormattedTextField.font", "PasswordField.font", "TextArea.font",
+      "TextPane.font", "EditorPane.font", "Table.font", "TableHeader.font",
+      "List.font", "Tree.font", "ToolTip.font", "Spinner.font",
+      "TitledBorder.font", "ProgressBar.font"
+  };
+  private static final String[] TEXT_UI_KEYS = {
+      "Label.foreground", "Button.foreground", "ToggleButton.foreground",
+      "CheckBox.foreground", "RadioButton.foreground", "TextField.foreground",
+      "FormattedTextField.foreground", "PasswordField.foreground",
+      "TextArea.foreground", "TextPane.foreground", "EditorPane.foreground",
+      "ComboBox.foreground", "List.foreground", "Table.foreground",
+      "TableHeader.foreground", "Menu.foreground", "MenuItem.foreground",
+      "CheckBoxMenuItem.foreground", "RadioButtonMenuItem.foreground",
+      "ToolTip.foreground", "Spinner.foreground", "TitledBorder.titleColor"
+  };
+  private static volatile Font resolvedUiFont;
   private final SongModel model = new SongModel();
   private final JTable table = new RoundedTable(model);
   private final TableRowSorter<SongModel> sorter = new TableRowSorter<>(model);
@@ -210,7 +231,7 @@ final class TagWorkbenchWindow extends JFrame {
     });
     tipTimer.start();
     appendLogs(List.of(
-        "成功 | 工作台 | 版本 1.0.0 | 启动成功",
+        "成功 | 工作台 | 版本 1.0.1 | 启动成功",
         "成功 | 运行环境 | CPU 逻辑线程 " +
             Runtime.getRuntime().availableProcessors() +
             " | 扫描与匹配线程按任务数量动态分配，上限 32",
@@ -3320,7 +3341,17 @@ final class TagWorkbenchWindow extends JFrame {
         "MenuItem.margin", "ComboBox.buttonStyle", "defaultFont",
         "Button.arc", "Component.arc", "TextComponent.arc",
         "ScrollPane.arc", "ScrollBar.width", "Table.rowHeight",
-        "Component.focusWidth", "Button.innerFocusWidth"};
+        "Component.focusWidth", "Button.innerFocusWidth",
+        "Label.disabledForeground", "Button.disabledText",
+        "TextField.caretForeground", "TextField.placeholderForeground",
+        "FormattedTextField.caretForeground",
+        "PasswordField.caretForeground", "TextArea.caretForeground",
+        "TextPane.caretForeground", "EditorPane.caretForeground",
+        "ComboBox.selectionForeground", "List.selectionForeground",
+        "Menu.selectionForeground", "MenuItem.selectionForeground",
+        "CheckBoxMenuItem.selectionForeground",
+        "RadioButtonMenuItem.selectionForeground",
+        "ProgressBar.selectionForeground"};
     private static final Map<String, Object> previousValues = new HashMap<>();
     private static LookAndFeel previousLook;
     private static int references;
@@ -3331,6 +3362,10 @@ final class TagWorkbenchWindow extends JFrame {
       previousValues.clear();
       for (String key : KEYS)
         previousValues.put(key, UIManager.get(key));
+      for (String key : FONT_UI_KEYS)
+        previousValues.putIfAbsent(key, UIManager.get(key));
+      for (String key : TEXT_UI_KEYS)
+        previousValues.putIfAbsent(key, UIManager.get(key));
       applyLook();
     }
     static synchronized void release() {
@@ -3342,6 +3377,10 @@ final class TagWorkbenchWindow extends JFrame {
       } catch (UnsupportedLookAndFeelException ignored) {
       }
       for (String key : KEYS)
+        UIManager.put(key, previousValues.get(key));
+      for (String key : FONT_UI_KEYS)
+        UIManager.put(key, previousValues.get(key));
+      for (String key : TEXT_UI_KEYS)
         UIManager.put(key, previousValues.get(key));
       previousValues.clear();
       previousLook = null;
@@ -3355,6 +3394,13 @@ final class TagWorkbenchWindow extends JFrame {
     Color bg = dark ? new Color(32, 32, 32) : new Color(243, 243, 243);
     Color field = dark ? new Color(39, 39, 39) : new Color(249, 249, 249);
     Color selected = dark ? new Color(53, 67, 88) : new Color(222, 232, 249);
+    Color text = dark ? new Color(235, 235, 235) : new Color(32, 32, 32);
+    Color selectedText =
+        dark ? new Color(245, 245, 245) : new Color(24, 24, 24);
+    Color disabledText =
+        dark ? new Color(150, 150, 150) : new Color(112, 112, 112);
+    Color placeholder =
+        dark ? new Color(145, 145, 145) : new Color(125, 125, 125);
     UIManager.put("Panel.background", bg);
     UIManager.put("Viewport.background", bg);
     UIManager.put("RootPane.background", bg);
@@ -3365,10 +3411,25 @@ final class TagWorkbenchWindow extends JFrame {
     UIManager.put("TextField.background", field);
     UIManager.put("TextArea.background", field);
     UIManager.put("Table.background", bg);
-    UIManager.put("Table.foreground",
-                  dark ? new Color(235, 235, 235) : new Color(32, 32, 32));
-    UIManager.put("Table.selectionForeground",
-                  dark ? new Color(245, 245, 245) : new Color(24, 24, 24));
+    for (String key : TEXT_UI_KEYS)
+      UIManager.put(key, text);
+    UIManager.put("Label.disabledForeground", disabledText);
+    UIManager.put("Button.disabledText", disabledText);
+    UIManager.put("TextField.placeholderForeground", placeholder);
+    UIManager.put("TextField.caretForeground", text);
+    UIManager.put("FormattedTextField.caretForeground", text);
+    UIManager.put("PasswordField.caretForeground", text);
+    UIManager.put("TextArea.caretForeground", text);
+    UIManager.put("TextPane.caretForeground", text);
+    UIManager.put("EditorPane.caretForeground", text);
+    UIManager.put("Table.selectionForeground", selectedText);
+    UIManager.put("ComboBox.selectionForeground", selectedText);
+    UIManager.put("List.selectionForeground", selectedText);
+    UIManager.put("Menu.selectionForeground", selectedText);
+    UIManager.put("MenuItem.selectionForeground", selectedText);
+    UIManager.put("CheckBoxMenuItem.selectionForeground", selectedText);
+    UIManager.put("RadioButtonMenuItem.selectionForeground", selectedText);
+    UIManager.put("ProgressBar.selectionForeground", selectedText);
     UIManager.put("Table.selectionBackground", selected);
     UIManager.put("TableHeader.background", field);
     UIManager.put("ScrollPane.background", bg);
@@ -3394,8 +3455,10 @@ final class TagWorkbenchWindow extends JFrame {
     UIManager.put("MenuItem.selectionArc", 12);
     UIManager.put("MenuItem.margin", new Insets(6, 10, 6, 10));
     UIManager.put("ComboBox.buttonStyle", "button");
-    Font font = findFont();
+    Font font = new javax.swing.plaf.FontUIResource(findFont());
     UIManager.put("defaultFont", font);
+    for (String key : FONT_UI_KEYS)
+      UIManager.put(key, font);
     UIManager.put("Button.arc", 10);
     UIManager.put("Component.arc", 10);
     UIManager.put("TextComponent.arc", 10);
@@ -3406,11 +3469,73 @@ final class TagWorkbenchWindow extends JFrame {
     UIManager.put("Button.innerFocusWidth", 0);
   }
   private static Font findFont() {
-    for (String name : GraphicsEnvironment.getLocalGraphicsEnvironment()
-                           .getAvailableFontFamilyNames())
-      if (name.equalsIgnoreCase("MiSans") || name.startsWith("MiSans "))
-        return new Font(name, Font.PLAIN, 13);
-    return new Font("Microsoft YaHei UI", Font.PLAIN, 13);
+    Font cached = resolvedUiFont;
+    if (cached != null)
+      return cached;
+    synchronized (TagWorkbenchWindow.class) {
+      if (resolvedUiFont != null)
+        return resolvedUiFont;
+      try (InputStream stream = TagWorkbenchWindow.class
+               .getResourceAsStream("/fonts/MiSans-Medium.ttf")) {
+        if (stream != null) {
+          Font bundled =
+              Font.createFont(Font.TRUETYPE_FONT, stream).deriveFont(13f);
+          if (fontRenders(bundled)) {
+            resolvedUiFont = bundled;
+            return bundled;
+          }
+        }
+      } catch (Exception ignored) {
+        // Continue with installed fonts when the bundled font cannot load.
+      }
+      List<String> installed = List.of(
+          GraphicsEnvironment.getLocalGraphicsEnvironment()
+              .getAvailableFontFamilyNames());
+      List<String> candidates = new ArrayList<>();
+      for (String name : installed)
+        if (name.equalsIgnoreCase("MiSans") || name.startsWith("MiSans "))
+          candidates.add(name);
+      for (String fallback :
+           new String[] {"Microsoft YaHei UI", "Microsoft YaHei",
+                         "Noto Sans CJK SC", Font.DIALOG})
+        if (Font.DIALOG.equals(fallback) ||
+            installed.stream().anyMatch(fallback::equalsIgnoreCase))
+          candidates.add(fallback);
+      for (String name : new LinkedHashSet<>(candidates)) {
+        Font candidate = new Font(name, Font.PLAIN, 13);
+        if (fontRenders(candidate)) {
+          resolvedUiFont = candidate;
+          return candidate;
+        }
+      }
+      resolvedUiFont = new Font(Font.DIALOG, Font.PLAIN, 13);
+      return resolvedUiFont;
+    }
+  }
+  private static boolean fontRenders(Font font) {
+    final String probe = "音乐标签歌词 Aa09";
+    if (font == null || font.canDisplayUpTo(probe) >= 0)
+      return false;
+    BufferedImage image =
+        new BufferedImage(180, 40, BufferedImage.TYPE_INT_ARGB);
+    Graphics2D graphics = image.createGraphics();
+    try {
+      graphics.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
+                                RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+      graphics.setFont(font.deriveFont(18f));
+      graphics.setColor(Color.BLACK);
+      graphics.drawString(probe, 2, 27);
+    } catch (RuntimeException error) {
+      return false;
+    } finally {
+      graphics.dispose();
+    }
+    int painted = 0;
+    for (int y = 0; y < image.getHeight(); y++)
+      for (int x = 0; x < image.getWidth(); x++)
+        if ((image.getRGB(x, y) >>> 24) != 0 && ++painted >= 24)
+          return true;
+    return false;
   }
   private static boolean detectDarkMode() {
     try {

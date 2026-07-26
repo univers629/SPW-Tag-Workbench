@@ -22,6 +22,13 @@ SPW Tag Workbench 的整体源代码依据 **GNU General Public License v3.0 onl
 | jaudiotagger | LGPL-3.0-or-later |
 | JNA（仅编译及宿主运行时使用，不随插件分发） | Apache-2.0 OR LGPL-2.1-or-later |
 | Gradle Wrapper | Apache-2.0 |
+| MiSans Medium | 小米《MiSans 字体知识产权许可协议》 |
+
+带 MiSans 的发行包内置并使用未修改的 MiSans Medium 字体；系统字体轻量
+发行包不包含该字体。MiSans 的版权归小米科技有限责任公司所有，字体文件
+不作为独立产品分发。带字体发行包随附原始许可协议
+`MiSans_FONT_LICENSE.pdf`，许可详情亦可在
+[MiSans 官方下载页](https://hyperos.mi.com/font/zh/download/) 查阅。
 
 频谱功能在运行时调用 SPW 已经加载的 BASS 音频引擎，本插件不分发
 BASS 二进制文件。BASS 的相关权利归 Un4seen Developments 所有。

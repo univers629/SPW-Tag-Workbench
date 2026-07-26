@@ -115,7 +115,8 @@
 
 ## 界面与资源管理
 
-- 适配 SPW 深浅色，使用 MiSans（不可用时回退 Microsoft YaHei UI）、圆角组件、圆角菜单和沉浸式滚动条。
+- 适配 SPW 深浅色；提供内置 MiSans Medium 的推荐包和使用系统字体的
+  轻量包，并统一圆角组件、圆角菜单和沉浸式滚动条。
 - 页面动画按工作台所在显示器的当前刷新率调度。
 - 常用页面框架在工作台启动后预布局；封面结果、歌词候选和频谱图等瞬态数据在退出对应页面时释放。
 - 关闭工作台会取消扫描、匹配、下载和频谱任务，停止动画及滚动计时器，清理监听器、图片、缓存、日志与窗口引用。
@@ -123,16 +124,21 @@
 
 ## 安装
 
-1. 从 [Releases](https://github.com/univers629/SPW-Tag-Workbench/releases) 下载 `SPW-Tag-Workbench-1.0.0.zip`。
+1. 从 [Releases](https://github.com/univers629/SPW-Tag-Workbench/releases)
+   下载以下任一安装包：
+   - `SPW-Tag-Workbench-1.0.1-with-MiSans.zip`：内置 MiSans，推荐使用。
+   - `SPW-Tag-Workbench-1.0.1-system-font.zip`：不含字体，体积较小。
 2. 在 SPW 创意工坊的本地插件管理中导入 ZIP。
 3. 在模组配置页添加音乐文件夹，然后打开标签工作台。
 
-要求：SPW 1.15.2 或更高兼容版本、Java 21 运行环境。
+要求：SPW 1.15.2 或更高兼容版本、Java 21 运行环境。推荐包无需另行
+安装 MiSans；轻量包会依次使用系统 MiSans、Microsoft YaHei UI、
+Microsoft YaHei、Noto Sans CJK SC 或 Java Dialog。
 
 ## 构建
 
 ```powershell
-.\gradlew.bat clean build plugin
+.\gradlew.bat clean build plugin pluginLite
 ```
 
 构建产物位于 `build/distributions`。构建目录、Gradle/Kotlin 缓存、IDE 文件、日志、崩溃转储、环境变量文件和误建的嵌套仓库均已通过 `.gitignore` 排除。
