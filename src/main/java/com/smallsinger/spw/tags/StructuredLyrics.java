@@ -6,6 +6,8 @@ package com.smallsinger.spw.tags;
 import com.google.gson.*;
 import javax.crypto.Cipher;
 import javax.crypto.spec.SecretKeySpec;
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.ByteArrayInputStream;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
@@ -13,6 +15,10 @@ import java.security.MessageDigest;
 import java.util.*;
 import java.util.regex.*;
 import java.util.zip.InflaterInputStream;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
 
 final class StructuredLyrics {
     private static final byte[] QRC_KEY="!@#)(*$%123ZXC!@!@#)(NHL".getBytes(StandardCharsets.ISO_8859_1);
@@ -50,10 +56,144 @@ final class StructuredLyrics {
     static String apple(String id)throws Exception{
         if(id==null||id.isBlank())return "";
         JsonObject root=json(getApple("https://lyrics.paxsenix.org/apple-music/lyrics?id="+enc(id)+"&ttml=false"));
-        String enhanced=first(root,"elrcMultiPerson","elrc");if(!enhanced.isBlank())return enhanced.replaceAll("<(\\d{1,}:\\d{2}(?:[.:]\\d{1,3})?)>","[$1]");
+        String ttml=first(root,"ttmlContent");
+        if(ttml.isBlank()&&"TTML".equalsIgnoreCase(str(root,"type"))&&root.has("content")&&root.get("content").isJsonPrimitive())
+            ttml=root.get("content").getAsString();
+        if(!ttml.isBlank()){
+            try{
+                String parsed=parseTtml(ttml);
+                if(!parsed.isBlank())return parsed;
+            }catch(Exception ignored){}
+        }
         JsonArray content=root.has("content")&&root.get("content").isJsonArray()?root.getAsJsonArray("content"):new JsonArray();List<Line> lines=new ArrayList<>();
         for(JsonElement element:content){JsonObject line=element.getAsJsonObject();long start=number(line,"timestamp",0),end=number(line,"endtime",start);List<Word> words=new ArrayList<>();if(line.has("text")&&line.get("text").isJsonArray()){JsonArray items=line.getAsJsonArray("text");for(int i=0;i<items.size();i++){JsonObject word=items.get(i).getAsJsonObject();String text=str(word,"text");if(!text.isEmpty())words.add(new Word(number(word,"timestamp",start),number(word,"endtime",end),text+(needsSpace(text,i+1<items.size()?str(items.get(i+1).getAsJsonObject(),"text"):"")?" ":"")));}}if(words.isEmpty()){String plain=str(line,"plain");if(!plain.isBlank())words.add(new Word(start,end,plain));}if(!words.isEmpty())lines.add(new Line(start,end,words));}
         if(!lines.isEmpty())return render(lines,List.of(),List.of());
+        String enhanced=first(root,"elrcMultiPerson","elrc");if(!enhanced.isBlank())return normalizeAppleEnhanced(enhanced);
+        String plain=first(root,"lrc","plain");if(!plain.isBlank())return plain;
+        return "";
+    }
+
+    private static String parseTtml(String ttml)throws Exception{
+        DocumentBuilderFactory factory=DocumentBuilderFactory.newInstance();
+        factory.setNamespaceAware(true);
+        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING,true);
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl",true);
+        factory.setFeature("http://xml.org/sax/features/external-general-entities",false);
+        factory.setFeature("http://xml.org/sax/features/external-parameter-entities",false);
+        factory.setXIncludeAware(false);
+        factory.setExpandEntityReferences(false);
+        Document document=factory.newDocumentBuilder().parse(new ByteArrayInputStream(ttml.getBytes(StandardCharsets.UTF_8)));
+        NodeList paragraphs=document.getElementsByTagNameNS("*","p");
+        List<Line> lines=new ArrayList<>();
+        for(int i=0;i<paragraphs.getLength();i++){
+            Node node=paragraphs.item(i);if(!(node instanceof Element paragraph))continue;
+            long start=ttmlTime(paragraph.getAttribute("begin")),end=ttmlTime(paragraph.getAttribute("end"));
+            List<Word> words=new ArrayList<>();
+            NodeList children=paragraph.getChildNodes();
+            for(int j=0;j<children.getLength();j++){
+                Node child=children.item(j);
+                if(child.getNodeType()!=Node.ELEMENT_NODE||!"span".equalsIgnoreCase(child.getLocalName()!=null?child.getLocalName():child.getNodeName()))continue;
+                if(!(child instanceof Element span))continue;
+                String text=span.getTextContent();
+                if(text==null||text.isBlank())continue;
+                long wordStart=ttmlTime(span.getAttribute("begin"));
+                long wordEnd=ttmlTime(span.getAttribute("end"));
+                if(wordStart==0&&!span.hasAttribute("begin"))wordStart=start;
+                if(wordEnd==0&&!span.hasAttribute("end"))wordEnd=end;
+                words.add(new Word(wordStart,wordEnd,text));
+            }
+            if(words.isEmpty()){
+                String text=paragraph.getTextContent();
+                if(text!=null&&!text.isBlank())words.add(new Word(start,end,text.trim()));
+            }else{
+                for(int j=0;j+1<words.size();j++){
+                    Word current=words.get(j),next=words.get(j+1);
+                    if(needsSpace(current.text,next.text)&&!current.text.endsWith(" "))
+                        words.set(j,new Word(current.start,current.end,current.text+" "));
+                }
+            }
+            if(!words.isEmpty()){
+                if(start==0&&words.get(0).start>0)start=words.get(0).start;
+                if(end==0)end=words.get(words.size()-1).end;
+                lines.add(new Line(start,end,words));
+            }
+        }
+        return lines.isEmpty()?"":render(lines,List.of(),List.of());
+    }
+
+    private static long ttmlTime(String value){
+        String text=value==null?"":value.trim();if(text.isBlank())return 0;
+        try{
+            if(text.endsWith("ms"))return Math.round(Double.parseDouble(text.substring(0,text.length()-2)));
+            if(text.endsWith("s"))return Math.round(Double.parseDouble(text.substring(0,text.length()-1))*1000);
+            String[] parts=text.split(":");
+            if(parts.length==3)return Math.round((Long.parseLong(parts[0])*3600+Long.parseLong(parts[1]))*1000+Double.parseDouble(parts[2])*1000);
+            if(parts.length==2)return Math.round((Long.parseLong(parts[0])*60)*1000+Double.parseDouble(parts[1])*1000);
+            return Math.round(Double.parseDouble(text)*1000);
+        }catch(Exception ignored){return 0;}
+    }
+
+    private static String normalizeAppleEnhanced(String value){
+        return value.replaceAll("<(\\d{1,}:\\d{2}(?:[.:]\\d{1,3})?)>","[$1]")
+            .replaceAll("(?m)^(\\[\\d{1,}:\\d{2}(?:[.:]\\d{1,3})?])(?:v\\w+:\\s*)+","$1").trim();
+    }
+
+    static String appleOfficial(String id,String developerToken,String mediaUserToken)throws Exception{
+        if(id==null||id.isBlank()||developerToken==null||developerToken.isBlank()||mediaUserToken==null||mediaUserToken.isBlank())return "";
+        String region=System.getProperty("spw.apple.region","cn");
+        String url="https://amp-api.music.apple.com/v1/catalog/"+URLEncoder.encode(region,StandardCharsets.UTF_8)+"/songs/"+enc(id)+"?include=syllable-lyrics,lyrics&extend=ttmlLocalizations&l=zh-Hans&platform=web";
+        HttpURLConnection connection=(HttpURLConnection)URI.create(url).toURL().openConnection();
+        connection.setConnectTimeout(10000);connection.setReadTimeout(15000);
+        connection.setRequestProperty("Authorization","Bearer "+developerToken);
+        connection.setRequestProperty("Origin","https://music.apple.com");
+        connection.setRequestProperty("Referer","https://music.apple.com/");
+        connection.setRequestProperty("Cookie","media-user-token="+mediaUserToken);
+        connection.setRequestProperty("Accept","application/json, text/plain, */*");
+        connection.setRequestProperty("User-Agent","Lyrico/1.0 (github.com/Replica0110/Lyrico)");
+        JsonObject root;try(var in=connection.getInputStream()){root=json(MusicSources.readText(in));}
+        JsonArray data=root.has("data")&&root.get("data").isJsonArray()?root.getAsJsonArray("data"):new JsonArray();
+        if(data.isEmpty())return "";
+        JsonObject song=data.get(0).getAsJsonObject();
+        JsonObject relationships=song.has("relationships")&&song.get("relationships").isJsonObject()?song.getAsJsonObject("relationships"):new JsonObject();
+        for(String key:List.of("syllable-lyrics","lyrics")){
+            JsonObject relationship=relationships.has(key)&&relationships.get(key).isJsonObject()?relationships.getAsJsonObject(key):null;
+            if(relationship==null||!relationship.has("data")||!relationship.get("data").isJsonArray())continue;
+            for(JsonElement item:relationship.getAsJsonArray("data")){
+                if(!item.isJsonObject())continue;
+                JsonObject itemObject=item.getAsJsonObject();
+                JsonObject attrs=itemObject.has("attributes")&&itemObject.get("attributes").isJsonObject()?itemObject.getAsJsonObject("attributes"):itemObject;
+                String ttml=findTtml(attrs,0);
+                if(!ttml.isBlank()){
+                    String parsed=parseTtml(ttml);
+                    if(!parsed.isBlank())return parsed;
+                }
+            }
+        }
+        return "";
+    }
+
+    private static String findTtml(JsonElement value,int depth){
+        if(value==null||value.isJsonNull()||depth>8)return "";
+        if(value.isJsonPrimitive()&&value.getAsJsonPrimitive().isString()){
+            String text=value.getAsString().trim();
+            return text.contains("<tt")?text:"";
+        }
+        if(value.isJsonArray()){
+            for(JsonElement child:value.getAsJsonArray()){
+                String found=findTtml(child,depth+1);
+                if(!found.isBlank())return found;
+            }
+            return "";
+        }
+        if(value.isJsonObject()){
+            for(Map.Entry<String,JsonElement> entry:value.getAsJsonObject().entrySet()){
+                String key=entry.getKey().toLowerCase(Locale.ROOT);
+                if(key.contains("ttml")||key.equals("lyrics")){
+                    String found=findTtml(entry.getValue(),depth+1);
+                    if(!found.isBlank())return found;
+                }
+            }
+        }
         return "";
     }
 
@@ -79,12 +219,12 @@ final class StructuredLyrics {
 
     private static String decodeQrc(String value){if(value==null||value.isBlank())return "";try{return inflate(QrcDecryptor.decrypt(HexFormat.of().parseHex(value.replaceAll("[^0-9A-Fa-f]","")),QRC_KEY));}catch(Exception ignored){}try{return new String(Base64.getDecoder().decode(value),StandardCharsets.UTF_8);}catch(Exception ignored){return value;}}
     private static String decryptKrc(String base64)throws Exception{byte[] raw=Base64.getDecoder().decode(base64);byte[] encrypted=Arrays.copyOfRange(raw,4,raw.length);for(int i=0;i<encrypted.length;i++)encrypted[i]^=KRC_KEY[i%KRC_KEY.length];return inflate(encrypted);}
-    private static String inflate(byte[] bytes)throws Exception{try(var in=new InflaterInputStream(new ByteArrayInputStream(bytes))){return new String(in.readAllBytes(),StandardCharsets.UTF_8);}}
+    private static String inflate(byte[] bytes)throws Exception{try(var in=new InflaterInputStream(new ByteArrayInputStream(bytes))){return MusicSources.readText(in);}}
     private static String signedQuery(Map<String,String> custom)throws Exception{Map<String,String> params=new HashMap<>();params.put("appid","3116");params.put("clientver","11070");params.putAll(custom);StringBuilder raw=new StringBuilder();params.keySet().stream().sorted().forEach(k->raw.append(k).append('=').append(params.get(k)));params.put("signature",md5(KG_SALT+raw+KG_SALT));StringJoiner query=new StringJoiner("&");params.keySet().stream().sorted().forEach(k->query.add(enc(k)+"="+enc(params.get(k))));return query.toString();}
     private static String md5(String s)throws Exception{return HexFormat.of().formatHex(MessageDigest.getInstance("MD5").digest(s.getBytes(StandardCharsets.UTF_8)));}
-    private static String get(String url)throws Exception{HttpURLConnection c=open(url);try(var in=c.getInputStream()){return new String(in.readAllBytes(),StandardCharsets.UTF_8);}}
-    private static String getApple(String url)throws Exception{HttpURLConnection c=(HttpURLConnection)URI.create(url).toURL().openConnection();c.setConnectTimeout(10000);c.setReadTimeout(15000);c.setRequestProperty("Accept","application/json");c.setRequestProperty("User-Agent","Lyrico/1.0 (github.com/Replica0110/Lyrico)");try(var in=c.getInputStream()){return new String(in.readAllBytes(),StandardCharsets.UTF_8);}}
-    private static String post(String url,String body)throws Exception{HttpURLConnection c=open(url);c.setRequestMethod("POST");c.setDoOutput(true);c.setRequestProperty("Content-Type","application/json; charset=utf-8");try(var out=c.getOutputStream()){out.write(body.getBytes(StandardCharsets.UTF_8));}try(var in=c.getInputStream()){return new String(in.readAllBytes(),StandardCharsets.UTF_8);}}
+    private static String get(String url)throws Exception{HttpURLConnection c=open(url);try(var in=c.getInputStream()){return MusicSources.readText(in);}}
+    private static String getApple(String url)throws Exception{HttpURLConnection c=(HttpURLConnection)URI.create(url).toURL().openConnection();c.setConnectTimeout(10000);c.setReadTimeout(15000);c.setRequestProperty("Accept","application/json");c.setRequestProperty("User-Agent","Lyrico/1.0 (github.com/Replica0110/Lyrico)");try(var in=c.getInputStream()){return MusicSources.readText(in);}}
+    private static String post(String url,String body)throws Exception{HttpURLConnection c=open(url);c.setRequestMethod("POST");c.setDoOutput(true);c.setRequestProperty("Content-Type","application/json; charset=utf-8");try(var out=c.getOutputStream()){out.write(body.getBytes(StandardCharsets.UTF_8));}try(var in=c.getInputStream()){return MusicSources.readText(in);}}
     private static HttpURLConnection open(String url)throws Exception{HttpURLConnection c=(HttpURLConnection)URI.create(url).toURL().openConnection();c.setConnectTimeout(10000);c.setReadTimeout(15000);c.setRequestProperty("User-Agent","Android14-1070-11070-201-0-SearchSong-wifi");return c;}
     private static JsonObject json(String s){return JsonParser.parseString(s).getAsJsonObject();}
     private static String str(JsonObject o,String key){return o!=null&&o.has(key)&&!o.get(key).isJsonNull()?o.get(key).getAsString():"";}

@@ -1,6 +1,9 @@
 package com.smallsinger.spw.tags;
 
 import com.google.gson.*;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -10,6 +13,11 @@ final class MusicSources {
   private static final java.util.concurrent.ConcurrentHashMap<
       String, java.util.concurrent.FutureTask<byte[]>> COVER_CACHE =
       new java.util.concurrent.ConcurrentHashMap<>();
+  private static final long COVER_CACHE_MAX_BYTES = 32L * 1024 * 1024;
+  static final int MAX_TEXT_BYTES = 4 * 1024 * 1024;
+  private static final int MAX_COVER_BYTES = 12 * 1024 * 1024;
+  private static final java.util.concurrent.atomic.AtomicLong
+      COVER_CACHE_BYTES = new java.util.concurrent.atomic.AtomicLong();
   private static final MusicSource QQ = qq();
   private static final MusicSource NETEASE = netease();
   private static final MusicSource APPLE = apple();
@@ -584,13 +592,21 @@ final class MusicSources {
       JsonObject s = results.get(0).getAsJsonObject();
       String image = appleArtwork(s, 600);
       byte[] cover = image.isBlank() ? null : coverBytes(image);
+      String lyrics = "";
+      String trackId = str(s, "trackId");
+      if (!trackId.isBlank()) {
+        try {
+          lyrics = appleLyrics(trackId);
+        } catch (Exception ignored) {
+        }
+      }
       return new MusicSource.Result(
           str(s, "trackName"), str(s, "artistName"), str(s, "collectionName"),
           str(s, "artistName"), year(str(s, "releaseDate")),
           str(s, "trackNumber"), str(s, "discNumber"),
           str(s, "primaryGenreName"), "", "",
           longValue(first(s, "trackTimeMillis", "durationInMillis")),
-          "", "", cover);
+          lyrics, "", cover);
     });
   }
 
@@ -616,22 +632,29 @@ final class MusicSources {
     c.setReadTimeout(15000);
     c.setRequestProperty("User-Agent", "Mozilla/5.0");
     c.setRequestProperty("Referer", "https://y.qq.com/");
-    try (var in = c.getInputStream()) {
-      return in.readAllBytes();
-    }
+    return readConnectionBytes(c, MAX_TEXT_BYTES);
   }
   static byte[] coverBytes(String url) throws Exception {
     if (url == null || url.isBlank())
       return new byte[0];
     var created = new java.util.concurrent.FutureTask<byte[]>(
-        () -> getBytes(url));
+        () -> getCoverBytes(url));
     var task = COVER_CACHE.putIfAbsent(url, created);
     if (task == null) {
       task = created;
       created.run();
     }
     try {
-      return task.get();
+      byte[] bytes = task.get();
+      if (task == created && COVER_CACHE.get(url) == task) {
+        if (bytes.length > COVER_CACHE_MAX_BYTES) {
+          COVER_CACHE.remove(url, task);
+        } else if (bytes.length > 0) {
+          COVER_CACHE_BYTES.addAndGet(bytes.length);
+          trimCoverCache();
+        }
+      }
+      return bytes;
     } catch (java.util.concurrent.ExecutionException ex) {
       COVER_CACHE.remove(url, task);
       Throwable cause = ex.getCause();
@@ -643,8 +666,69 @@ final class MusicSources {
       throw ex;
     }
   }
+  private static byte[] getCoverBytes(String url) throws Exception {
+    HttpURLConnection c =
+        (HttpURLConnection)URI.create(url).toURL().openConnection();
+    c.setConnectTimeout(10000);
+    c.setReadTimeout(15000);
+    c.setRequestProperty("User-Agent", "Mozilla/5.0");
+    return readConnectionBytes(c, MAX_COVER_BYTES);
+  }
+  static byte[] readConnectionBytes(HttpURLConnection connection, int maxBytes)
+      throws IOException {
+    long length = connection.getContentLengthLong();
+    if (length > maxBytes)
+      throw new IOException("在线响应过大：" + length + " 字节");
+    try (InputStream input = connection.getInputStream()) {
+      return readBytes(input, maxBytes);
+    }
+  }
+  static byte[] readBytes(InputStream input, int maxBytes) throws IOException {
+    ByteArrayOutputStream output = new ByteArrayOutputStream(
+        Math.min(maxBytes, 8192));
+    byte[] buffer = new byte[8192];
+    int total = 0;
+    for (int count; (count = input.read(buffer)) >= 0;) {
+      if (count == 0)
+        continue;
+      if (count > maxBytes - total)
+        throw new IOException("在线响应超过大小限制：" + maxBytes + " 字节");
+      output.write(buffer, 0, count);
+      total += count;
+    }
+    return output.toByteArray();
+  }
+  static String readText(InputStream input) throws IOException {
+    return new String(readBytes(input, MAX_TEXT_BYTES), StandardCharsets.UTF_8);
+  }
   static void clearCoverCache() {
     COVER_CACHE.clear();
+    COVER_CACHE_BYTES.set(0);
+  }
+
+  private static void trimCoverCache() {
+    while (COVER_CACHE_BYTES.get() > COVER_CACHE_MAX_BYTES ||
+           COVER_CACHE.size() > 64) {
+      boolean removed = false;
+      for (var entry : COVER_CACHE.entrySet()) {
+        if (!entry.getValue().isDone())
+          continue;
+        try {
+          byte[] bytes = entry.getValue().get();
+          if (COVER_CACHE.remove(entry.getKey(), entry.getValue())) {
+            COVER_CACHE_BYTES.addAndGet(-bytes.length);
+            removed = true;
+            break;
+          }
+        } catch (Exception ignored) {
+          COVER_CACHE.remove(entry.getKey(), entry.getValue());
+          removed = true;
+          break;
+        }
+      }
+      if (!removed)
+        break;
+    }
   }
   private static JsonArray qqSearch(String keyword) throws Exception {
     JsonObject param = new JsonObject();
@@ -730,7 +814,7 @@ final class MusicSources {
       out.write(body.getBytes(StandardCharsets.UTF_8));
     }
     try (var in = c.getInputStream()) {
-      return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+      return readText(in);
     }
   }
   private static JsonObject json(String s) {
@@ -788,13 +872,21 @@ final class MusicSources {
     int limit = Math.max(1, perSource);
     List<LyricSearchMatch> out =
         Collections.synchronizedList(new ArrayList<>());
-    java.util.concurrent.CompletableFuture.allOf(
-        java.util.concurrent.CompletableFuture.runAsync(
-            () -> lyricQqMatches(keyword, limit, out)),
-        java.util.concurrent.CompletableFuture.runAsync(
-            () -> lyricNeteaseMatches(keyword, limit, out)),
-        java.util.concurrent.CompletableFuture.runAsync(
-            () -> lyricKugouMatches(keyword, limit, out))).join();
+    try (java.util.concurrent.ExecutorService pool =
+             java.util.concurrent.Executors.newFixedThreadPool(
+                 4, runnable -> {
+                   Thread thread = new Thread(runnable, "lyrics-provider");
+                   thread.setDaemon(true);
+                   return thread;
+                 })) {
+      List<java.util.concurrent.Callable<Void>> tasks = List.of(
+          () -> { lyricQqMatches(keyword, limit, out); return null; },
+          () -> { lyricNeteaseMatches(keyword, limit, out); return null; },
+          () -> { lyricKugouMatches(keyword, limit, out); return null; },
+          () -> { lyricAppleMatches(keyword, limit, out); return null; });
+      for (java.util.concurrent.Future<Void> task : pool.invokeAll(tasks))
+        task.get();
+    }
     Comparator<LyricSearchMatch> order;
     if (wantedDurationMillis > 0)
       order = Comparator
@@ -804,22 +896,37 @@ final class MusicSources {
                   : Long.MAX_VALUE)
           .thenComparing(
               Comparator.comparingInt(LyricSearchMatch::relevance).reversed())
-          .thenComparingInt(match -> sourceRank(match.source()));
+          .thenComparing(LyricSearchMatch::source);
     else
       order = Comparator
           .comparingInt(LyricSearchMatch::relevance).reversed()
-          .thenComparingInt(match -> sourceRank(match.source()));
+          .thenComparing(LyricSearchMatch::source);
     out.sort(order);
     return List.copyOf(out);
   }
-  private static int sourceRank(String source) {
-    return switch (source) {
-      case "QQ 音乐" -> 0;
-      case "酷狗音乐" -> 1;
-      case "网易云音乐" -> 2;
-      default -> 3;
-    };
+  static String appleLyrics(String id) {
+    try {
+      String lyrics = StructuredLyrics.apple(id);
+      if (!lyrics.isBlank())
+        return lyrics;
+    } catch (Exception ignored) {
+    }
+    try {
+      String token = appleToken();
+      String mediaUserToken = appleMediaUserToken();
+      if (!token.isBlank() && !mediaUserToken.isBlank())
+        return StructuredLyrics.appleOfficial(id, token, mediaUserToken);
+    } catch (Exception ignored) {
+    }
+    return "";
   }
+  private static String appleMediaUserToken() {
+    String value = System.getProperty("spw.apple.mediaUserToken", "");
+    if (value.isBlank())
+      value = System.getenv("SPW_APPLE_MEDIA_USER_TOKEN");
+    return value == null ? "" : value.trim();
+  }
+
   private static void lyricQqMatches(String keyword, int limit,
                                     List<LyricSearchMatch> out) {
     try {
@@ -896,6 +1003,28 @@ final class MusicSources {
     } catch (Exception ignored) {
     }
   }
+  private static void lyricAppleMatches(String keyword, int limit,
+                                        List<LyricSearchMatch> out) {
+    try {
+      JsonArray songs = appleSongs(keyword, Math.max(20, limit));
+      int count = 0;
+      for (JsonElement element : songs) {
+        JsonObject song = element.getAsJsonObject();
+        String title = str(song, "trackName");
+        String id = str(song, "trackId");
+        if (title.isBlank() || id.isBlank())
+          continue;
+        out.add(new LyricSearchMatch(
+            title, str(song, "artistName"), str(song, "collectionName"),
+            durationMillis(first(song, "trackTimeMillis", "durationInMillis")),
+            "Apple Music", searchRelevance(keyword, title), id, "",
+            longValue(first(song, "trackTimeMillis", "durationInMillis"))));
+        if (++count >= limit)
+          break;
+      }
+    } catch (Exception ignored) {
+    }
+  }
   private static int searchRelevance(String keyword, String title) {
     String wanted = normalizeMatchText(keyword), found = normalizeMatchText(title);
     if (wanted.isBlank() || found.isBlank())
@@ -948,6 +1077,7 @@ final class MusicSources {
       case "酷狗音乐" -> StructuredLyrics.kugouAdvanced(
           match.id(), match.auxiliary(), match.durationMillis(),
           match.artist() + " - " + match.title());
+      case "Apple Music" -> appleLyrics(match.id());
       default -> "";
     };
   }
@@ -1141,6 +1271,13 @@ final class MusicSources {
   private static String appleToken() throws Exception {
     if (!appleDeveloperToken.isBlank())
       return appleDeveloperToken;
+    String configured = System.getProperty("spw.apple.developerToken", "");
+    if (configured.isBlank())
+      configured = System.getenv("SPW_APPLE_DEVELOPER_TOKEN");
+    if (configured != null && !configured.isBlank()) {
+      appleDeveloperToken = configured.trim();
+      return appleDeveloperToken;
+    }
     JsonObject headers = new JsonObject();
     headers.addProperty(
         "Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
@@ -1202,7 +1339,7 @@ final class MusicSources {
       for (Map.Entry<String, JsonElement> entry : headers.entrySet())
         c.setRequestProperty(entry.getKey(), entry.getValue().getAsString());
     try (var in = c.getInputStream()) {
-      return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+      return readText(in);
     }
   }
   private static byte[] firstAvailableBytes(String... urls) throws Exception {
@@ -1236,7 +1373,7 @@ final class MusicSources {
       out.write(body.getBytes(StandardCharsets.UTF_8));
     }
     try (var in = c.getInputStream()) {
-      return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+      return readText(in);
     }
   }
 }

@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "com.smallsinger.spw.tags"
-version = "1.0.1"
+version = "1.1.0"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21
@@ -33,7 +33,7 @@ val pluginManifest = mapOf(
     "Plugin-Name" to pluginName,
     "Plugin-Description" to "在线批量匹配封面和逐字歌词，查看歌曲频谱图，编辑、预览音乐标签信息",
     "Plugin-Version" to pluginVersion,
-    "Plugin-Provider" to "smallsinger",
+    "Plugin-Provider" to "univers629",
     "Plugin-Open-Source-Url" to "https://github.com/univers629/SPW-Tag-Workbench",
     "Plugin-License" to "GPL-3.0-only",
     "Plugin-Has-Config" to "true"

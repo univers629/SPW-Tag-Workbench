@@ -18,8 +18,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -166,6 +169,7 @@ final class TagWorkbenchWindow extends JFrame {
   private volatile long latestMatchToken;
   private int current = -1;
   private static final boolean dark = detectDarkMode();
+  private static final int MAX_LOG_CHARS = 200_000;
 
   static TagWorkbenchWindow create() {
     WorkbenchLook.acquire();
@@ -223,6 +227,7 @@ final class TagWorkbenchWindow extends JFrame {
     String[] tips = {
         "小提示：在三个区域点右键，就能分别匹配全部标签、基础标签或歌词",
         "勾选跟随播放后，当前播放和切换到的歌曲都会自动进入列表",
+        "双击底部提示文字区域，即可查看详细日志",
         "列表有点挤时，点击右键即可清空列表"};
     int[] tipIndex = {0};
     tipTimer = new Timer(4800, e -> {
@@ -231,10 +236,10 @@ final class TagWorkbenchWindow extends JFrame {
     });
     tipTimer.start();
     appendLogs(List.of(
-        "成功 | 工作台 | 版本 1.0.1 | 启动成功",
+        "成功 | 工作台 | 版本 1.1.0 | 启动成功",
         "成功 | 运行环境 | CPU 逻辑线程 " +
             Runtime.getRuntime().availableProcessors() +
-            " | 扫描与匹配线程按任务数量动态分配，上限 32",
+            " | 扫描线程按任务数量分配，匹配线程最多 12 个",
             "成功 | 标签源 | QQ、网易云、Apple、酷狗及聚合源已加载 | 网络状态将在首次匹配时验证"));
   }
 
@@ -663,7 +668,22 @@ final class TagWorkbenchWindow extends JFrame {
       } catch (BadLocationException ignored) {
       }
     }
+    trimLogDocument(doc);
     logArea.setCaretPosition(doc.getLength());
+  }
+  private static void trimLogDocument(StyledDocument document) {
+    int excess = document.getLength() - MAX_LOG_CHARS;
+    if (excess <= 0)
+      return;
+    try {
+      int remove = excess;
+      int newline = document.getText(excess, Math.min(512,
+          document.getLength() - excess)).indexOf('\n');
+      if (newline >= 0)
+        remove += newline + 1;
+      document.remove(0, remove);
+    } catch (BadLocationException ignored) {
+    }
   }
   private static boolean isRedLogLine(String line) {
     return line != null &&
@@ -686,6 +706,18 @@ final class TagWorkbenchWindow extends JFrame {
     String message = error.getMessage();
     return error.getClass().getSimpleName() + "：" +
         (message == null || message.isBlank() ? "无详细信息" : message);
+  }
+  private static String writeErrorText(Throwable error) {
+    String message = "";
+    for (Throwable current = error; current != null; current = current.getCause()) {
+      if (current.getMessage() != null && !current.getMessage().isBlank()) {
+        message = current.getMessage();
+        if (message.matches("(?s).*newPosition\\s*>\\s*limit.*"))
+          return "保存失败：这个音频文件的 M4A 标签结构不兼容。请先用 Mp3tag 或 foobar2000 重新保存文件标签，再重试。";
+      }
+    }
+    return "保存失败：" +
+        (message == null || message.isBlank() ? "文件可能被占用或没有写入权限，请检查后重试。" : message);
   }
   private void statusDefault(String text) {
     status.setForeground(SUB);
@@ -1114,10 +1146,8 @@ final class TagWorkbenchWindow extends JFrame {
     languages.add(lyricTranslation);
     languages.add(lyricRomanization);
     lyricOffset.setPreferredSize(new Dimension(112, 26));
-    lyricOffset.putClientProperty("FlatLaf.style", "arc: 10");
     if (lyricOffset.getEditor() instanceof JSpinner.DefaultEditor editor) {
       editor.getTextField().setHorizontalAlignment(SwingConstants.CENTER);
-      editor.getTextField().putClientProperty("FlatLaf.style", "arc: 10");
     }
     JPanel offsetRow = labeledControl("偏移量", lyricOffset);
     JPanel chinese = compactFlow();
@@ -1456,7 +1486,7 @@ final class TagWorkbenchWindow extends JFrame {
     long startedNanos = System.nanoTime();
     long token = lyricPreviewSequence.incrementAndGet();
     appendLogs(List.of("提示 | 歌词预览 | " + query +
-                       " | 开始查询 QQ音乐、酷狗音乐和网易云音乐"));
+                       " | 开始并行查询 QQ音乐、酷狗音乐、网易云音乐和 Apple Music"));
     lyricSearchTask = previewExecutor.submit(() -> {
       List<MusicSources.LyricSearchMatch> rows;
       Exception failure = null;
@@ -2148,7 +2178,7 @@ final class TagWorkbenchWindow extends JFrame {
     Map<Integer, AudioTagData> snapshots = new HashMap<>();
     for (int row : rows)
       snapshots.put(row, model.items.get(row));
-    int plannedWorkers = workerCount(rows.size());
+    int plannedWorkers = matchWorkerCount(rows.size());
     int skippedCount = requestedCount - rows.size();
     long startedNanos = System.nanoTime();
     statusDefault(source.name() +
@@ -2164,6 +2194,7 @@ final class TagWorkbenchWindow extends JFrame {
       Set<Integer> failedRows = ConcurrentHashMap.newKeySet();
       AtomicInteger failed = new AtomicInteger(), processed = new AtomicInteger();
       AtomicBoolean redLevelFailure = new AtomicBoolean();
+      AtomicBoolean memoryFailure = new AtomicBoolean();
       int workers = plannedWorkers;
       ExecutorService matchPool = Executors.newFixedThreadPool(
           workers, workerThreadFactory("tag-match-worker"));
@@ -2171,9 +2202,10 @@ final class TagWorkbenchWindow extends JFrame {
       try (matchPool) {
         if (disposed)
           return;
-        List<Future<?>> matchTasks = new ArrayList<>();
-        for (int i : rows)
-          matchTasks.add(matchPool.submit(() -> {
+        CompletionService<Void> completion =
+            new ExecutorCompletionService<>(matchPool);
+        java.util.function.Function<Integer, Callable<Void>> taskFactory =
+            i -> () -> {
         List<String> rowDetails = new ArrayList<>();
         AudioTagData d = snapshots.get(i);
         String song = d.displayName();
@@ -2225,8 +2257,7 @@ final class TagWorkbenchWindow extends JFrame {
             boolean meta =
                 scope == MatchScope.ALL || scope == MatchScope.METADATA;
             boolean lyric =
-                (scope == MatchScope.ALL || scope == MatchScope.LYRICS) &&
-                !"Apple Music".equals(source.name());
+                scope == MatchScope.ALL || scope == MatchScope.LYRICS;
             boolean coverMatch =
                 scope == MatchScope.ALL || scope == MatchScope.COVER;
             byte[] matchedCover = coverMatch ? m.cover() : d.cover();
@@ -2344,12 +2375,36 @@ final class TagWorkbenchWindow extends JFrame {
             }
           });
         }
-          }));
-        for (Future<?> task : matchTasks)
+            return null;
+            };
+        int nextRow = 0;
+        int inFlight = 0;
+        while (nextRow < rows.size() && inFlight < workers) {
+          int i = rows.get(nextRow++);
+          completion.submit(taskFactory.apply(i));
+          inFlight++;
+        }
+        while (inFlight > 0) {
           try {
-            task.get();
-          } catch (Exception ignored) {
+            completion.take().get();
+          } catch (java.util.concurrent.ExecutionException error) {
+            if (error.getCause() instanceof OutOfMemoryError) {
+              memoryFailure.set(true);
+              redLevelFailure.set(true);
+              matchPool.shutdownNow();
+              break;
+            }
+          } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            break;
           }
+          inFlight--;
+          if (nextRow < rows.size()) {
+            int i = rows.get(nextRow++);
+            completion.submit(taskFactory.apply(i));
+            inFlight++;
+          }
+        }
       } finally {
         if (activeMatchPool == matchPool)
           activeMatchPool = null;
@@ -2409,8 +2464,9 @@ final class TagWorkbenchWindow extends JFrame {
         if (token == latestMatchToken) {
           int failCount = failedRows.size() + (updates.size() - applied),
               complete = Math.max(0, applied - incompleteRows.size());
-          String summary =
-              "匹配完成：成功 " + complete + "，失败 " + failCount +
+          String summary = memoryFailure.get()
+              ? "匹配已中止：内存不足，已完成的结果仍保留，请减少一次匹配的歌曲数量后重试"
+              : "匹配完成：成功 " + complete + "，失败 " + failCount +
               (batch && scope == MatchScope.ALL
                    ? (failCount > 0
                           ? "，失败歌曲已置顶并保持勾选"
@@ -2634,6 +2690,9 @@ final class TagWorkbenchWindow extends JFrame {
         1, Runtime.getRuntime().availableProcessors());
     return Math.max(1, Math.min(tasks, Math.min(processors, 32)));
   }
+  private static int matchWorkerCount(int tasks) {
+    return Math.min(workerCount(tasks), 12);
+  }
   private static java.util.concurrent.ThreadFactory workerThreadFactory(
       String prefix) {
     AtomicInteger sequence = new AtomicInteger();
@@ -2662,9 +2721,6 @@ final class TagWorkbenchWindow extends JFrame {
     stylePopup(sources.getPopupMenu());
     for (MusicSource source : MusicSources.ALL) {
       if (!allowAggregate && "聚合源".equals(source.name()))
-        continue;
-      if (scope == MatchScope.LYRICS &&
-          "Apple Music".equals(source.name()))
         continue;
       JMenuItem item = new JMenuItem(source.name());
       styleMenuItem(item);
@@ -2972,7 +3028,7 @@ final class TagWorkbenchWindow extends JFrame {
                          " | 已写入 " + data.file().getName() + "，用时 " +
                          elapsedText(startedNanos)));
     } catch (Exception ex) {
-      statusError("保存失败：" + ex.getMessage());
+      statusError(writeErrorText(ex));
       appendLogs(List.of("异常 | 标签写入 | " + data.displayName() + " | " +
                          errorDetail(ex) + "，用时 " +
                          elapsedText(startedNanos)));
@@ -2993,9 +3049,10 @@ final class TagWorkbenchWindow extends JFrame {
         ok++;
       } catch (Exception ex) {
         fail++;
+        String friendly = writeErrorText(ex);
         appendLogs(List.of("异常 | 标签写入 | " +
                            model.items.get(i).displayName() + " | " +
-                           errorDetail(ex)));
+                           friendly + " | 详细信息：" + errorDetail(ex)));
       }
     String summary = "批量保存完成：成功 " + ok + "，失败 " + fail;
     if (fail == 0)
@@ -3039,7 +3096,6 @@ final class TagWorkbenchWindow extends JFrame {
   }
   private static JTextField input() {
     JTextField f = new JTextField();
-    f.putClientProperty("FlatLaf.style", "arc: 10");
     f.putClientProperty("JTextField.placeholderText", "");
     f.setMargin(new Insets(6, 7, 6, 7));
     int height = Math.max(28, f.getPreferredSize().height);
@@ -3053,7 +3109,6 @@ final class TagWorkbenchWindow extends JFrame {
     a.setMinimumSize(new Dimension(0, 40));
     a.setLineWrap(true);
     a.setWrapStyleWord(true);
-    a.putClientProperty("FlatLaf.style", "arc: 10");
     a.setBorder(new EmptyBorder(8, 8, 8, 8));
     return a;
   }
@@ -3065,7 +3120,6 @@ final class TagWorkbenchWindow extends JFrame {
       setMinimumSize(new Dimension(0, 40));
       setLineWrap(true);
       setWrapStyleWord(true);
-      putClientProperty("FlatLaf.style", "arc: 10");
       setBorder(new EmptyBorder(8, 8, 8, 8));
     }
     protected void paintComponent(Graphics g) {

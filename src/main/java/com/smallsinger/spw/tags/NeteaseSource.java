@@ -101,7 +101,7 @@ final class NeteaseSource {
         JsonObject header=new JsonObject();header.addProperty("clientSign","00:11:22:33:44:55@@@SPWTAGS1@@@@@@"+java.util.UUID.randomUUID().toString().replace("-",""));header.addProperty("osver","Microsoft-Windows-10--build-26100-64bit");header.addProperty("deviceId",java.util.UUID.randomUUID().toString().replace("-",""));header.addProperty("os","pc");header.addProperty("appver","3.1.3.203419");header.addProperty("requestId",String.valueOf(System.currentTimeMillis()));
         params.addProperty("header",header.toString());params.addProperty("e_r",true);String text=params.toString();String digest=java.util.HexFormat.of().formatHex(MessageDigest.getInstance("MD5").digest(("nobody"+apiPath+"use"+text+"md5forencrypt").getBytes(StandardCharsets.UTF_8)));String data=apiPath+"-36cd479b6b5-"+text+"-36cd479b6b5-"+digest;
         Cipher cipher=Cipher.getInstance("AES/ECB/PKCS5Padding");SecretKeySpec key=new SecretKeySpec("e82ckenh8dichen8".getBytes(StandardCharsets.UTF_8),"AES");cipher.init(Cipher.ENCRYPT_MODE,key);String body="params="+java.util.HexFormat.of().formatHex(cipher.doFinal(data.getBytes(StandardCharsets.UTF_8)));
-        HttpURLConnection connection=open("https://interface.music.163.com"+path);connection.setRequestMethod("POST");connection.setDoOutput(true);connection.setRequestProperty("Content-Type","application/x-www-form-urlencoded");connection.setRequestProperty("Cookie","os=pc; appver=3.1.3.203419; deviceId="+header.get("deviceId").getAsString());try(var output=connection.getOutputStream()){output.write(body.getBytes(StandardCharsets.UTF_8));}byte[] encrypted;try(var input=connection.getInputStream()){encrypted=input.readAllBytes();}cipher.init(Cipher.DECRYPT_MODE,key);
+        HttpURLConnection connection=open("https://interface.music.163.com"+path);connection.setRequestMethod("POST");connection.setDoOutput(true);connection.setRequestProperty("Content-Type","application/x-www-form-urlencoded");connection.setRequestProperty("Cookie","os=pc; appver=3.1.3.203419; deviceId="+header.get("deviceId").getAsString());try(var output=connection.getOutputStream()){output.write(body.getBytes(StandardCharsets.UTF_8));}byte[] encrypted;try(var input=connection.getInputStream()){encrypted=MusicSources.readBytes(input,MusicSources.MAX_TEXT_BYTES);}cipher.init(Cipher.DECRYPT_MODE,key);
         return JsonParser.parseString(new String(cipher.doFinal(encrypted),StandardCharsets.UTF_8)).getAsJsonObject();
     }
 
@@ -110,12 +110,12 @@ final class NeteaseSource {
         connection.setRequestMethod("POST"); connection.setDoOutput(true);
         connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
         try (var output = connection.getOutputStream()) { output.write(body.getBytes(StandardCharsets.UTF_8)); }
-        try (var input = connection.getInputStream()) { return new String(input.readAllBytes(), StandardCharsets.UTF_8); }
+        try (var input = connection.getInputStream()) { return MusicSources.readText(input); }
     }
 
     private static byte[] getBytes(String url) throws Exception {
         HttpURLConnection connection = open(url); connection.setRequestMethod("GET");
-        try (var input = connection.getInputStream()) { return input.readAllBytes(); }
+        try (var input = connection.getInputStream()) { return MusicSources.readBytes(input, 12 * 1024 * 1024); }
     }
 
     private static HttpURLConnection open(String url) throws Exception {
