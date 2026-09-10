@@ -20,7 +20,7 @@
 - 支持 MP3、FLAC、M4A、OGG、Opus、WAV、WMA。
 - 文件扫描和标签读取按 CPU 逻辑线程动态并发，在线匹配最多 12 个工作线程；界面更新统一回到 Swing 事件线程。
 - 普通列表显示标题、艺术家和专辑；展开后增加时长、位深、比特率，并可调整列宽和列顺序。
-- 表头复选框可全选或取消全选；搜索会实时匹配除歌词外的全部标签内容。
+- 表头复选框只作用于当前搜索结果，无搜索词时等同全库全选或取消全选；搜索会实时匹配除歌词外的全部标签内容。
 - 匹配结束后自动把失败或不完整歌曲移到列表前方，并保留勾选；完整成功项取消勾选。
 - 鼠标悬停可查看被列宽截断的完整内容，滚动后提示会自动关闭。
 - 勾选“跟随播放”后，SPW 当前播放或切换到的本地文件会加入列表并定位。
@@ -126,8 +126,8 @@
 
 1. 从 [Releases](https://github.com/univers629/SPW-Tag-Workbench/releases)
    下载以下任一安装包：
-   - `SPW-Tag-Workbench-1.1.0-with-MiSans.zip`：内置 MiSans，推荐使用。
-   - `SPW-Tag-Workbench-1.1.0-system-font.zip`：不含字体，体积较小。
+   - `SPW-Tag-Workbench-1.2.0-with-MiSans.zip`：内置 MiSans，推荐使用。
+   - `SPW-Tag-Workbench-1.2.0-system-font.zip`：不含字体，体积较小。
 2. 在 SPW 创意工坊的本地插件管理中导入 ZIP。
 3. 在模组配置页添加音乐文件夹，然后打开标签工作台。
 

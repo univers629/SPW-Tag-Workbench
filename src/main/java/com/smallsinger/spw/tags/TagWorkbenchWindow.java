@@ -236,7 +236,7 @@ final class TagWorkbenchWindow extends JFrame {
     });
     tipTimer.start();
     appendLogs(List.of(
-        "成功 | 工作台 | 版本 1.1.0 | 启动成功",
+        "成功 | 工作台 | 版本 1.2.0 | 启动成功",
         "成功 | 运行环境 | CPU 逻辑线程 " +
             Runtime.getRuntime().availableProcessors() +
             " | 扫描线程按任务数量分配，匹配线程最多 12 个",
@@ -363,13 +363,15 @@ final class TagWorkbenchWindow extends JFrame {
     listPanel = new JPanel(new BorderLayout(0, 5));
     listPanel.setBorder(titled("歌曲列表"));
     JTableHeader compactHeader =
-        new UnifiedTableHeader(columnsModel, true, model);
+        new UnifiedTableHeader(columnsModel, true, model,
+                               this::onHeaderSelectionChanged);
     compactHeader.setTable(table);
     compactHeader.setReorderingAllowed(false);
     compactHeader.setResizingAllowed(false);
     compactSongHeader = compactHeader;
     expandedSongHeader =
-        new UnifiedTableHeader(columnsModel, true, model);
+        new UnifiedTableHeader(columnsModel, true, model,
+                               this::onHeaderSelectionChanged);
     expandedSongHeader.setTable(table);
     expandedSongHeader.setReorderingAllowed(false);
     expandedSongHeader.setResizingAllowed(true);
@@ -769,6 +771,74 @@ final class TagWorkbenchWindow extends JFrame {
     if (tableScroll != null && tableScroll.getColumnHeader() != null)
       tableScroll.getColumnHeader().repaint();
   }
+  /** 当前搜索/排序视图内已勾选的模型行。 */
+  private List<Integer> checkedVisibleRows() {
+    List<Integer> rows = new ArrayList<>();
+    for (int v = 0; v < table.getRowCount(); v++) {
+      int row = table.convertRowIndexToModel(v);
+      if (row >= 0 && row < model.checked.size() && model.checked.get(row))
+        rows.add(row);
+    }
+    return rows;
+  }
+  private int checkedVisibleCount() {
+    return checkedVisibleRows().size();
+  }
+  /**
+   * 批量操作的实际范围。
+   *
+   * 勾选状态是全库的，而屏幕只显示当前搜索结果。当搜索隐藏了已勾选的歌曲时，
+   * 直接按勾选集合执行等于让用户在看不见的情况下改动搜索范围之外的歌曲，
+   * 因此这里必须由用户明确选择范围；无搜索词时视图等于全库，不打断操作。
+   * 返回 null 表示用户取消，调用方应直接返回。
+   */
+  private List<Integer> batchCheckedRows() {
+    List<Integer> all = model.checkedRows();
+    if (all.isEmpty() || sorter.getRowFilter() == null)
+      return all;
+    List<Integer> visible = checkedVisibleRows();
+    int hidden = all.size() - visible.size();
+    if (hidden <= 0)
+      return all;
+    String[] options = {"仅当前搜索结果（" + visible.size() + " 首）",
+                        "全部已勾选（" + all.size() + " 首）",
+                        "取消"};
+    int choice = JOptionPane.showOptionDialog(
+        this,
+        "当前搜索隐藏了 " + hidden + " 首已勾选的歌曲。\n\n"
+            + "· 搜索结果共 " + table.getRowCount() + " 首，其中已勾选 "
+            + visible.size() + " 首\n"
+            + "· 全库共 " + all.size() + " 首被勾选\n\n"
+            + "请选择本次要处理的范围，避免改动你看不到的歌曲：",
+        "确认处理范围", JOptionPane.YES_NO_CANCEL_OPTION,
+        JOptionPane.WARNING_MESSAGE, null, options, options[2]);
+    if (choice == 0) {
+      appendLogs(List.of("提示 | 批量操作 | 范围限定为当前搜索结果 " +
+                         visible.size() + " 首（另有 " + hidden +
+                         " 首已勾选但不在搜索结果内，本次不处理）"));
+      return visible;
+    }
+    if (choice == 1) {
+      appendLogs(List.of("提示 | 批量操作 | 范围为全部已勾选 " + all.size() +
+                         " 首，其中 " + hidden + " 首不在当前搜索结果内"));
+      return all;
+    }
+    statusDefault("已取消批量操作");
+    appendLogs(List.of("提示 | 批量操作 | 用户取消：当前搜索隐藏了 " + hidden +
+                       " 首已勾选的歌曲"));
+    return null;
+  }
+  /** 表头全选后刷新两个表头，并把实际选中范围写进状态栏。 */
+  private void onHeaderSelectionChanged() {
+    repaintCheckHeaders();
+    int visible = table.getRowCount();
+    if (sorter.getRowFilter() != null)
+      statusDefault("已勾选搜索结果 " + checkedVisibleCount() + "/" + visible +
+                    " 首（全库共 " + model.checkedRows().size() +
+                    " 首被勾选）");
+    else
+      statusDefault("已勾选 " + checkedVisibleCount() + " 首");
+  }
   private void prepareExpandedList() {
     TableColumnModel model = table.getColumnModel();
     for (TableColumn column : expandedColumns) {
@@ -1087,7 +1157,8 @@ final class TagWorkbenchWindow extends JFrame {
       }
     });
     JTableHeader candidateHeader =
-        new UnifiedTableHeader(lyricCandidateTable.getColumnModel(), true, null);
+        new UnifiedTableHeader(lyricCandidateTable.getColumnModel(), true, null,
+                               null);
     candidateHeader.setTable(lyricCandidateTable);
     candidateHeader.setReorderingAllowed(false);
     candidateHeader.setResizingAllowed(false);
@@ -1964,7 +2035,10 @@ final class TagWorkbenchWindow extends JFrame {
                                  Exception error) {}
 
   void openLibraryFolders(List<File> folders) {
-    loadLibraryFolders(folders, false, true);
+    // 打开工作台不预勾选任何歌曲：勾选集合是批量匹配与批量保存的唯一范围来源，
+    // 默认全选会让用户在屏幕上只看到搜索结果的情况下误操作整个音乐库。
+    // 勾选状态不落盘，因此改动对已安装的旧版本同样立即生效。
+    loadLibraryFolders(folders, false, false);
   }
 
   private void reloadList() {
@@ -2132,10 +2206,20 @@ final class TagWorkbenchWindow extends JFrame {
   private void matchSelected(MatchScope scope, MusicSource source,
                              boolean batch) {
     sync();
+    if (batch && matchRunning.get()) {
+      // 提前返回，避免先弹范围确认再告知任务已在运行。
+      statusDefault("已有匹配任务正在运行，请等待完成");
+      return;
+    }
     int displayedRow = current;
-    List<Integer> requestedRows =
-        batch ? model.checkedRows()
-              : (displayedRow >= 0 ? List.of(displayedRow) : List.of());
+    List<Integer> requestedRows;
+    if (batch) {
+      requestedRows = batchCheckedRows();
+      if (requestedRows == null)
+        return;
+    } else {
+      requestedRows = displayedRow >= 0 ? List.of(displayedRow) : List.of();
+    }
     if (requestedRows.isEmpty()) {
       statusDefault(batch ? "请先勾选需要匹配的歌曲"
                           : "请先选择一首歌曲");
@@ -2952,6 +3036,7 @@ final class TagWorkbenchWindow extends JFrame {
         }
       });
     table.clearSelection();
+    repaintCheckHeaders();
     statusDefault("筛选结果：" + table.getRowCount() + " 首");
   }
   private void clearSearch() {
@@ -3036,7 +3121,9 @@ final class TagWorkbenchWindow extends JFrame {
   }
   private void saveSelected() {
     sync();
-    List<Integer> selectedRows = model.checkedRows();
+    List<Integer> selectedRows = batchCheckedRows();
+    if (selectedRows == null)
+      return;
     if (selectedRows.isEmpty()) {
       statusDefault("请先勾选需要保存的歌曲");
       return;
@@ -3609,17 +3696,20 @@ final class TagWorkbenchWindow extends JFrame {
   private static final class UnifiedTableHeader extends JTableHeader {
     private final boolean separators;
     private final SongModel songs;
+    private final Runnable onCheckChanged;
     UnifiedTableHeader(TableColumnModel model, boolean separators,
-                       SongModel songs) {
+                       SongModel songs, Runnable onCheckChanged) {
       super(model);
       this.separators = separators;
       this.songs = songs;
+      this.onCheckChanged = onCheckChanged;
       setOpaque(false);
       setPreferredSize(new Dimension(0, 38));
       setDefaultRenderer((table, value, selected, focus, row, column) -> {
         int modelIndex = getColumnModel().getColumn(column).getModelIndex();
         if (songs != null && modelIndex == 0)
-          return new HeaderCheck(songs.allChecked(), songs.anyChecked());
+          return new HeaderCheck(songs.allVisibleChecked(getTable()),
+                                 songs.anyVisibleChecked(getTable()));
         JLabel label = new JLabel(value == null ? "" : value.toString(),
                                   SwingConstants.CENTER);
         label.setOpaque(false);
@@ -3634,8 +3724,13 @@ final class TagWorkbenchWindow extends JFrame {
           int view = columnAtPoint(e.getPoint());
           if (songs != null && view >= 0 &&
               getColumnModel().getColumn(view).getModelIndex() == 0) {
-            songs.selectAll(!songs.allChecked());
-            repaint();
+            JTable target = getTable();
+            songs.setVisibleChecked(target,
+                                    !songs.allVisibleChecked(target));
+            if (onCheckChanged != null)
+              onCheckChanged.run();
+            else
+              repaint();
           }
         }
       });
@@ -4852,7 +4947,7 @@ final class TagWorkbenchWindow extends JFrame {
       return new Insets(5, 7, 5, 7);
     }
   }
-  private static final class SongModel extends AbstractTableModel {
+  static final class SongModel extends AbstractTableModel {
     final List<AudioTagData> items = new ArrayList<>();
     final List<Boolean> checked = new ArrayList<>();
     void add(AudioTagData d) {
@@ -4888,12 +4983,32 @@ final class TagWorkbenchWindow extends JFrame {
       if (size > 0)
         fireTableRowsDeleted(0, size - 1);
     }
-    boolean allChecked() {
-      return !checked.isEmpty() &&
-          checked.stream().allMatch(Boolean::booleanValue);
+    /** 当前视图（搜索/排序后的可见行）是否全部勾选。 */
+    boolean allVisibleChecked(JTable view) {
+      int n = view == null ? items.size() : view.getRowCount();
+      if (n == 0)
+        return false;
+      for (int v = 0; v < n; v++)
+        if (!checked.get(view == null ? v : view.convertRowIndexToModel(v)))
+          return false;
+      return true;
     }
-    boolean anyChecked() {
-      return checked.stream().anyMatch(Boolean::booleanValue);
+    /** 当前视图内是否存在已勾选的行。 */
+    boolean anyVisibleChecked(JTable view) {
+      int n = view == null ? items.size() : view.getRowCount();
+      for (int v = 0; v < n; v++)
+        if (checked.get(view == null ? v : view.convertRowIndexToModel(v)))
+          return true;
+      return false;
+    }
+    /** 只改写当前视图内的行；被搜索过滤隐藏的行保持原勾选状态，空视图不做改动。 */
+    void setVisibleChecked(JTable view, boolean value) {
+      int n = view == null ? items.size() : view.getRowCount();
+      if (n == 0)
+        return;
+      for (int v = 0; v < n; v++)
+        checked.set(view == null ? v : view.convertRowIndexToModel(v), value);
+      fireTableDataChanged();
     }
     void selectAll(boolean v) {
       for (int i = 0; i < checked.size(); i++)
