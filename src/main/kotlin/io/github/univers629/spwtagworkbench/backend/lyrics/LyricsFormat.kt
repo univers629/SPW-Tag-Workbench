@@ -66,9 +66,14 @@ object LyricsFormat {
         if (!format.isWordSynced) return false
         val lines = parse(raw).filter { it.startMs >= 0L }
         if (lines.isEmpty()) return false
-        val withCells = lines.filter { it.cells.isNotEmpty() && validCells(it.cells) }
+        // 按时间戳分组再判定：同一时间戳下的多条行是「原文 / 译文 / 罗马音」轨道
+        // （见 [parseTtml] 与 [krcToStructured]），附加轨道天然没有字单元。
+        // 若按行数算，一首每行都有译文的 TTML 会被拉低到 50%，误判成逐行。
+        // 判据取「该时间戳是否至少有一条带合格字单元」。
+        val groups = lines.groupBy { it.startMs }
+        val withCells = groups.count { (_, group) -> group.any { it.cells.isNotEmpty() && validCells(it.cells) } }
         // 覆盖率不到八成就算逐行，避免「几行有字时间、大部分没有」被吹成逐字
-        return withCells.size * 10 >= lines.size * 8
+        return withCells * 10 >= groups.size * 8
     }
 
     /** 字单元自身时间是否合法：起止不倒置、整体单调递增。 */
@@ -85,6 +90,14 @@ object LyricsFormat {
 
     /** TTML 根标记：Apple Music / AMLL 都用这套命名空间。 */
     private val TTML_HINT = Regex("""<tt[\s>]""", RegexOption.IGNORE_CASE)
+
+    /**
+     * TTML 帧数写法（`HH:MM:SS:ff`）折算用的帧率。
+     *
+     * 规范里帧率来自根元素的 `ttp:frameRate`，Apple 的实际文件没用到帧数写法，
+     * 所以这里给一个保守默认值而不是去解析属性 —— 遇到没有声明帧率的文件也不至于算错量级。
+     */
+    private const val DEFAULT_TTML_FRAME_RATE = 25L
 
     /** ESLyric / 增强型 LRC 的词级标记：`<mm:ss.xx>`。 */
     private val ANGLE_STAMP = Regex("""<\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?>""")
@@ -519,13 +532,26 @@ object LyricsFormat {
     // ── TTML（Apple Music / AMLL） ────────────────────────────────────────────
 
     /**
-     * 解析 TTML。
+     * 解析 TTML（Apple Music / AMLL）。
      *
-     * 结构：`<p begin end>` 是一行，子 `<span begin end>` 是词/字单元。
-     * `ttm:agent="v2"` 之类标记的是和声/背景人声，跳过（只留主唱轨）。
+     * 结构：`<p begin end ttm:agent itunes:key>` 是一行，其内 `<span begin end>` 是词/字单元。
      *
-     * 用 JDK 自带的 DOM 解析，不引第三方 XML 库；同时禁掉外部实体，
-     * 避免恶意歌词文件触发 XXE。
+     * 三处分流都看**属性值**，不按 `xml:id` 猜：
+     * - `ttm:role="x-translation"` → 译文轨道，`"x-roman"` → 罗马音轨道。
+     *   两者写成**与主行同一时间戳的后续行** —— 与 KRC / YRC 的轨道约定一致
+     *   （见 [io.github.univers629.spwtagworkbench.data.Repo] 的 `filterLyricTracks`：
+     *   同一时间戳第 1/2/3 条依次是原文 / 译文 / 罗马音），因此三个语言开关对 TTML 同样生效。
+     *   它们**不进正文**，也不产生没有时间的假字单元。
+     * - `ttm:role="x-bg"` → 背景人声，从正文 cell 里剥离，按惯例挂到行尾括号内。
+     * - `ttm:agent` 只表示演唱者，**不参与过滤**。`xml:id` 是文件里任意分配的：
+     *   实测 Apple 把对唱的另一方写成 `v2` + `type="other"`，那是**正文**；
+     *   背景人声靠的是 `ttm:role="x-bg"`。按 `v2`/`v3` 丢行会把对唱歌曲的一半歌词删掉。
+     *
+     * 空白按 TTML 规范处理：TTML 是空白敏感的，`</span> <span>` 之间的行内空白是
+     * **词间空格**，必须归并到前一个单元，否则 `We're` + `swaying` 会粘成 `We'reswaying`。
+     * 所以这里遍历**子节点**（含文本节点），而不是只取 `<span>` 元素。
+     *
+     * 用 JDK 自带的 DOM 解析，不引第三方 XML 库；同时禁掉外部实体，避免恶意歌词文件触发 XXE。
      */
     private fun parseTtml(text: String): List<LyricLine> {
         val factory =
@@ -551,60 +577,210 @@ object LyricsFormat {
                     .toList()
             }
 
-        val lines = mutableListOf<LyricLine>()
+        // 主行与它的两条附加轨道必须成对保存：附加轨道与主行**同时间戳**，
+        // 不能混进主行列表一起参与 finish()（那会把主行的结束时间压成等于起始）。
+        val dated = mutableListOf<DatedLine>()
         val paragraphs = doc.getElementsByTagNameNS("*", "p")
 
         for (i in 0 until paragraphs.length) {
             val p = paragraphs.item(i) as? org.w3c.dom.Element ?: continue
 
-            // 背景人声轨跳过
-            val agent = attributeByLocalName(p, "agent").lowercase()
-            if (agent == "v2" || agent == "v3") continue
+            val scan = TtmlScan()
+            scanTtmlChildren(p, scan, inBackground = false)
 
-            val lineStart = ttmlTime(p.getAttribute("begin"))
-            val lineEnd = ttmlTime(p.getAttribute("end"))
+            val cells = trimTtmlCellEdges(scan.main)
+            val bodyText = cells.joinToString("") { it.text }
+            val background = scan.background.toString().trim()
 
-            // 子 span = 词/字单元
-            val cells = mutableListOf<LyricCell>()
-            val spans = p.getElementsByTagNameNS("*", "span")
-            for (j in 0 until spans.length) {
-                val s = spans.item(j) as? org.w3c.dom.Element ?: continue
-                val cellText = s.textContent.orEmpty().trim()
-                if (cellText.isEmpty()) continue
-                val cellStart = ttmlTime(s.getAttribute("begin"))
-                val cellEnd = ttmlTime(s.getAttribute("end"))
-                cells +=
-                    LyricCell(
-                        text = cellText,
-                        startMs = cellStart,
-                        endMs = if (cellEnd >= 0) cellEnd else -1L,
-                    )
-            }
-
+            // 背景人声不占 cell，按惯例附在行尾括号内
             val lineText =
-                if (cells.isNotEmpty()) {
-                    cells.joinToString("") { it.text }
-                } else {
-                    p.textContent.orEmpty().trim()
+                when {
+                    bodyText.isEmpty() -> if (background.isEmpty()) "" else "($background)"
+                    background.isEmpty() -> bodyText
+                    else -> "$bodyText ($background)"
                 }
             if (lineText.isBlank()) continue
 
-            // 行时间：p 上没有就取第一个 span 的
+            val lineStart = ttmlTime(p.getAttribute("begin"))
+            val lineEnd = ttmlTime(p.getAttribute("end"))
+            // 行时间：p 上没有就取第一个带时间的单元
             val start = if (lineStart >= 0) lineStart else cells.firstOrNull()?.startMs ?: -1L
-            lines +=
-                LyricLine(
-                    startMs = start,
-                    endMs = lineEnd,
-                    text = lineText,
-                    cells = cells.filter { it.startMs >= 0 },
+
+            dated +=
+                DatedLine(
+                    line =
+                        LyricLine(
+                            startMs = start,
+                            endMs = lineEnd,
+                            text = lineText,
+                            cells = cells.filter { it.startMs >= 0 },
+                        ),
+                    translation = scan.translation.toString().trim(),
+                    romanization = scan.romanization.toString().trim(),
                 )
         }
 
-        // 计时行排前面，无时间的行保持原序跟在后面
-        val timed = lines.filter { it.startMs >= 0 }.sortedBy { it.startMs }
-        val untimed = lines.filter { it.startMs < 0 }
-        return finish(timed) + untimed
+        // 先只对主行排序并补结束时间，再按「原文 → 译文 → 罗马音」展开
+        val timed = dated.filter { it.line.startMs >= 0 }.sortedBy { it.line.startMs }
+        val untimed = dated.filter { it.line.startMs < 0 }
+        val finished = finish(timed.map { it.line })
+        val lines = mutableListOf<LyricLine>()
+        // 用 zip 把「补完结束时间的行」与「它的附加轨道」配对，不靠下标对齐：
+        // finish() 内部会再排一次序，若日后改了排序策略，按下标取会静默错配。
+        for ((line, source) in finished.zip(timed)) {
+            lines += line
+            if (source.translation.isNotEmpty()) {
+                lines += LyricLine(startMs = line.startMs, endMs = line.endMs, text = source.translation)
+            }
+            if (source.romanization.isNotEmpty()) {
+                lines += LyricLine(startMs = line.startMs, endMs = line.endMs, text = source.romanization)
+            }
+        }
+        // 无时间的行保持原序跟在后面（含它们自己的轨道）
+        for (source in untimed) {
+            lines += source.line
+            if (source.translation.isNotEmpty()) {
+                lines += LyricLine(startMs = -1L, text = source.translation)
+            }
+            if (source.romanization.isNotEmpty()) {
+                lines += LyricLine(startMs = -1L, text = source.romanization)
+            }
+        }
+        return lines
     }
+
+    /** 一行主歌词 + 它的译文 / 罗马音轨道（两者都可能为空串）。 */
+    private data class DatedLine(
+        val line: LyricLine,
+        val translation: String,
+        val romanization: String,
+    )
+
+    /** 一趟 `<p>` 扫描的中间结果：主轨字单元 + 三条附加轨道。 */
+    private class TtmlScan {
+        val main = mutableListOf<LyricCell>()
+        val translation = StringBuilder()
+        val romanization = StringBuilder()
+        val background = StringBuilder()
+    }
+
+    /**
+     * 遍历 TTML 行内的子节点，按 `ttm:role` 分流。
+     *
+     * **必须保留文本节点**：词间空格就写在 `</span> <span>` 之间，只取 span 元素会把它丢掉。
+     */
+    private fun scanTtmlChildren(
+        parent: org.w3c.dom.Node,
+        scan: TtmlScan,
+        inBackground: Boolean,
+    ) {
+        val children = parent.childNodes
+        for (i in 0 until children.length) {
+            val node = children.item(i) ?: continue
+            when (node.nodeType) {
+                org.w3c.dom.Node.TEXT_NODE, org.w3c.dom.Node.CDATA_SECTION_NODE -> {
+                    val raw = ttmlInlineText(node.nodeValue)
+                    if (raw.isEmpty()) continue
+                    // 空白属于前一个单元（TTML 空白敏感）
+                    if (inBackground) scan.background.append(raw) else appendTtmlInline(raw, scan.main)
+                }
+
+                org.w3c.dom.Node.ELEMENT_NODE -> {
+                    val element = node as org.w3c.dom.Element
+                    when (attributeByLocalName(element, "role").lowercase()) {
+                        // 译文 / 罗马音：整段进独立轨道，不进正文；也不做字单元
+                        "x-translation" -> scan.translation.append(ttmlInlineText(element.textContent))
+                        "x-roman" -> scan.romanization.append(ttmlInlineText(element.textContent))
+                        // 背景人声：递归收集，正文里不留它
+                        "x-bg" -> scanTtmlChildren(element, scan, inBackground = true)
+                        else -> {
+                            val begin = ttmlTime(element.getAttribute("begin"))
+                            if (!inBackground && begin >= 0L) {
+                                // 带时间的 span = 一个词 / 字单元
+                                val end = ttmlTime(element.getAttribute("end"))
+                                val cellText = ttmlInlineText(element.textContent)
+                                if (cellText.isNotEmpty()) {
+                                    scan.main +=
+                                        LyricCell(
+                                            text = cellText,
+                                            startMs = begin,
+                                            endMs = if (end >= begin) end else -1L,
+                                        )
+                                }
+                            } else {
+                                // 容器 span（自身无时间）或背景轨：继续向下拆
+                                scanTtmlChildren(element, scan, inBackground)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 把行内文本并入主轨。
+     *
+     * 已有字单元时**合并到前一个单元的末尾**（`</span> <span>` 之间的空格属于前一个词）；
+     * 一个单元都还没有时（`<p>纯文本</p>` 或行首就有文字）先存一个无时间的单元，
+     * 它最后会作为整行文本保留下来。
+     */
+    private fun appendTtmlInline(
+        raw: String,
+        main: MutableList<LyricCell>,
+    ) {
+        if (raw.isEmpty()) return
+        if (main.isEmpty()) {
+            main += LyricCell(text = raw)
+            return
+        }
+        val last = main[main.size - 1]
+        main[main.size - 1] = last.copy(text = last.text + raw)
+    }
+
+    /**
+     * 去掉整行首尾的空白。
+     *
+     * 只动第一个单元的开头与最后一个单元的末尾：词间空格必须留着，
+     * 否则 `We're` / `swaying` 的间隔又没了。
+     */
+    private fun trimTtmlCellEdges(cells: List<LyricCell>): List<LyricCell> {
+        if (cells.isEmpty()) return emptyList()
+        val out = cells.toMutableList()
+        out[0] = out[0].copy(text = out[0].text.trimStart())
+        val last = out.size - 1
+        out[last] = out[last].copy(text = out[last].text.trimEnd())
+        return out.filter { it.text.isNotEmpty() }
+    }
+
+    /**
+     * 行内文本的空白处理。
+     *
+     * TTML 是空白敏感的：`</span> <span>` 之间那个空格是**词间分隔**，必须保留。
+     * 但同一段行内文本可能来自两种排版，得区分开：
+     *
+     * | 输入片段 | 含义 | 处理 |
+     * |---|---|---|
+     * | `" "`（压缩文件里的单个空格） | 词间分隔 | 保留为一个空格 |
+     * | `"\n      "`（美化排版的缩进） | 排版噪声 | 丢弃 |
+     * | `"abc\n  def"`（混合内容） | 真实文本 | 折叠为单个空格 |
+     *
+     * 判据是「整段都是空白 **且** 含换行」→ 排版缩进。真实 Apple / amll-ttml-db 的文件
+     * 是压缩过的（只有第一种），但用户手写或编辑器格式化后的文件会引入第二种；
+     * 若不区分，`こん` 与 `にちは` 之间会被塞进一个由缩进折叠成的空格。
+     *
+     * 行首/行尾的残留空格由 [trimTtmlCellEdges] 去掉。
+     */
+    private fun ttmlInlineText(value: String?): String {
+        val raw = value.orEmpty()
+        if (raw.isEmpty()) return raw
+        // 整段纯空白且含换行 → 是排版缩进，不是词间空格
+        if (raw.isBlank() && (raw.contains('\n') || raw.contains('\r'))) return ""
+        return WHITESPACE_RUN.replace(raw, " ")
+    }
+
+    /** 连续空白（含换行）。折叠成单个空格用。 */
+    private val WHITESPACE_RUN = Regex("""\s+""")
 
     /** 按 local name 取属性，忽略命名空间前缀（`ttm:agent` / `agent` 都能取到）。 */
     private fun attributeByLocalName(
@@ -623,7 +799,16 @@ object LyricsFormat {
     /**
      * TTML 时间值转毫秒。
      *
-     * 支持 `hh:mm:ss.mmm`、`hh:mm:ss:ff`（帧）、`1234ms`、`1.5s` 四种写法。
+     * 支持四种写法，**全部由 Apple / AMLL 的真实文件实测确认**：
+     * - `MM:SS.fff` —— 实测**主用**格式（如 `00:00.515`、`20.519`、`4:04.497`）
+     * - `HH:MM:SS.fff` —— 规范允许，三种冒号段
+     * - `12.3s` / `12.3ms` —— offset-time
+     * - `HH:MM:SS:ff` —— 帧数，按 [DEFAULT_TTML_FRAME_RATE] 折算
+     *
+     * 关键点：**`MM:SS.fff` 只有两段**。此前要求冒号分段 ≥ 3，导致真实文件中
+     * 每一个时间值都返回 -1（整首歌解析成"无时间轴、无逐字"），是 TTML 路径
+     * 完全失效的根因。冒号段数由此改为 2 段起。
+     *
      * 解析不了返回 -1（由调用方跳过该行）。
      */
     private fun ttmlTime(raw: String?): Long {
@@ -635,12 +820,18 @@ object LyricsFormat {
         if (v.endsWith("s", ignoreCase = true)) {
             return ((v.dropLast(1).toDoubleOrNull() ?: return -1L) * 1000.0).toLong()
         }
+        // 纯秒（无冒号无单位）：Apple 的 AMLL 文件里出现过 `20.519` / `23.530`
+        if (!v.contains(':')) {
+            return v.toDoubleOrNull()?.let { (it * 1000.0).toLong() } ?: -1L
+        }
         val parts = v.split(':')
-        if (parts.size < 3) return -1L
-        val h = parts[0].toLongOrNull() ?: return -1L
-        val m = parts[1].toLongOrNull() ?: return -1L
-        val secPart = parts[2]
-        val base = (h * 3600L + m * 60L) * 1000L
+        // MM:SS.fff（两段）/ HH:MM:SS.fff（三段）/ HH:MM:SS:ff（四段）
+        if (parts.size < 2) return -1L
+        // 段数不同，首段含义不同：三段/四段时首段是小时，两段时首段是分钟
+        val hours = if (parts.size >= 3) parts[0].toLongOrNull() ?: return -1L else 0L
+        val minutes = if (parts.size >= 3) parts[1].toLongOrNull() ?: return -1L else parts[0].toLongOrNull() ?: return -1L
+        val secPart = parts[if (parts.size >= 3) 2 else 1]
+        val base = (hours * 3600L + minutes * 60L) * 1000L
         val dot = secPart.indexOf('.')
         if (dot >= 0) {
             val s = secPart.substring(0, dot).toLongOrNull() ?: return -1L
@@ -648,11 +839,11 @@ object LyricsFormat {
             val ms = frac.padEnd(3, '0').take(3).toLongOrNull() ?: 0L
             return base + s * 1000L + ms
         }
-        // hh:mm:ss:ff —— 帧数按 25fps 折算
+        // HH:MM:SS:ff —— 帧数按 [DEFAULT_TTML_FRAME_RATE] 折算
         if (parts.size >= 4) {
             val s = secPart.toLongOrNull() ?: return -1L
             val f = parts[3].toLongOrNull() ?: 0L
-            return base + s * 1000L + f * 40L
+            return base + s * 1000L + f * (1000L / DEFAULT_TTML_FRAME_RATE)
         }
         val s = secPart.toLongOrNull() ?: return -1L
         return base + s * 1000L

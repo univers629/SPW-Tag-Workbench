@@ -132,6 +132,36 @@ object CoverMime {
 }
 
 /**
+ * 主封面选取：优先 Front Cover（type=3），并跳过艺术家类图片。
+ *
+ * 艺术家图（Artist / LeadArtist / Band）属于艺术家槽，不能被当成专辑封面：
+ * 文件里只有一张艺术家图时，取第一张会把艺人头像显示到主封面位置。
+ *
+ * 类型字段只用于排除艺术家图，**不校验取值范围**：部分工具把该字段写成
+ * `0xFFFFFFFF`（读出为 -1），按范围校验会把一张完好的可解码封面整个丢掉。
+ * 类型未知时按封面处理。
+ */
+internal fun frontCoverArtwork(tag: org.jaudiotagger.tag.Tag?): org.jaudiotagger.tag.images.Artwork? {
+    val pictures = runCatching { tag?.artworkList }.getOrNull().orEmpty()
+
+    fun typeOf(art: org.jaudiotagger.tag.images.Artwork): Int = runCatching { art.pictureType }.getOrDefault(0)
+
+    fun usableAsCover(type: Int): Boolean = type !in PictureTypeStandard.ARTIST_CHAIN
+    val picked =
+        pictures.firstOrNull { typeOf(it) == PictureTypeStandard.FRONT_COVER }
+            ?: pictures.firstOrNull { usableAsCover(typeOf(it)) }
+    if (picked == null && pictures.isNotEmpty()) {
+        Diag.log("cover-pick: 文件里只有艺术家图，没有可用的主封面")
+    }
+    // 类型超出标准取值时按封面处理，只在真出现时记一条，便于确认这条路径
+    val pickedType = picked?.let { typeOf(it) }
+    if (pickedType != null && pickedType !in 0..20) {
+        Diag.log("cover-pick: 图片类型 $pickedType 超出标准取值，已按封面处理")
+    }
+    return picked
+}
+
+/**
  * 封面缓存。
  *
  * 同一首歌不要反复解码：字节按曲目 key 缓存，超过容量按最近最少使用淘汰。
@@ -169,6 +199,7 @@ object CoverStore {
         }
     }
 
+    /** 只清单图缓存。整体清空请用 [clearPictures]（插件停止时调用）。 */
     @Synchronized
     fun clear() {
         cache.clear()
@@ -189,7 +220,7 @@ object CoverStore {
         val bytes =
             try {
                 val audio = AudioFileIO.read(file)
-                audio.tag?.firstArtwork?.binaryData
+                frontCoverArtwork(audio.tag)?.binaryData
             } catch (t: Throwable) {
                 Diag.log("cover: 读取失败 ${file.name} ${t.javaClass.simpleName}")
                 null
@@ -201,8 +232,34 @@ object CoverStore {
     // ── 多图读取 ─────────────────────────────────────────────────────────────
 
     private const val MAX_PIC_ENTRIES = 12
+
+    /**
+     * 多图缓存的字节预算。
+     *
+     * 只限条数不够：这里缓存的是曲目**全部内嵌图片的原始字节**
+     * （[EmbeddedPicture.bytes]），封面常见 1~5MB、多图文件更大，
+     * 12 首就可能上百 MB。与单图缓存（[MAX_BYTES]）一样按字节淘汰。
+     */
+    private const val MAX_PIC_BYTES = 48L * 1024L * 1024L
+
     private val picOrder = ArrayDeque<String>()
     private val picCache = HashMap<String, List<EmbeddedPicture>>()
+    private var picCachedBytes = 0L
+
+    /** 一组内嵌图片的总字节数。 */
+    private fun bytesOf(list: List<EmbeddedPicture>): Long {
+        var sum = 0L
+        for (p in list) sum += p.bytes.size
+        return sum
+    }
+
+    /** 按访问序淘汰，直到条数与字节都在预算内。 */
+    private fun trimPicCache() {
+        while (picOrder.size > MAX_PIC_ENTRIES || picCachedBytes > MAX_PIC_BYTES) {
+            val evicted = picOrder.removeFirstOrNull() ?: break
+            picCache.remove(evicted)?.let { picCachedBytes -= bytesOf(it) }
+        }
+    }
 
     /**
      * 读全部内嵌图片（带类型与描述）。
@@ -296,29 +353,36 @@ object CoverStore {
                 emptyList()
             }
 
-        picCache[path] = list
+        picCache.put(path, list)?.let { picCachedBytes -= bytesOf(it) }
+        picCachedBytes += bytesOf(list)
         picOrder.remove(path)
         picOrder.addLast(path)
-        while (picOrder.size > MAX_PIC_ENTRIES) {
-            picOrder.removeFirstOrNull()?.let { picCache.remove(it) }
-        }
+        trimPicCache()
         return list
     }
 
     /** 写入封面后清掉该曲目的图片缓存，否则界面还是旧图。 */
     @Synchronized
     fun invalidate(path: String) {
-        picCache.remove(path)
-        cache.remove(path)
+        picCache.remove(path)?.let { picCachedBytes -= bytesOf(it) }
+        cache.remove(path)?.let { cachedBytes -= it.size }
         order.remove(path)
         picOrder.remove(path)
     }
 
-    /** 全部清空（插件停止时调用）。 */
+    /**
+     * 全部清空（插件停止时调用）。
+     *
+     * 两条缓存一起清：多图缓存持有的是图片原始字节，停用插件后不该继续驻留。
+     */
     @Synchronized
     fun clearPictures() {
         picCache.clear()
         picOrder.clear()
+        picCachedBytes = 0L
+        cache.clear()
+        order.clear()
+        cachedBytes = 0L
     }
 }
 
@@ -365,10 +429,14 @@ object TrackReader {
 
         return try {
             val kind = ContainerKind.detect(file)
-            if (kind == ContainerKind.TTA) {
-                // TTA 的主标签习惯是文件开头的 ID3v2，其次才是尾部的 APEv2
+            // TTA 与 MPC 的主标签都可能是文件开头的 ID3v2，其次才是尾部 APEv2。
+            // 只走 APEv2 时，带 ID3v2 前缀的文件会读不出标签（jaudiotagger 不支持这两种容器）。
+            if (kind == ContainerKind.TTA || kind == ContainerKind.MPC) {
                 val tag = Id3v2.read(file)
-                if (tag != null) return trackFromId3(tag, path, withCover)
+                if (tag != null) {
+                    val fromId3 = trackFromId3(tag, path, withCover)
+                    if (fromId3 != null) return fromId3
+                }
             }
             if (kind.isApeV2) {
                 val track = readApeV2(file, path, withCover)
@@ -388,7 +456,12 @@ object TrackReader {
             val audio = AudioFileIO.read(file)
             val tag = audio.tag
             val header = audio.audioHeader
-            val artwork = if (withCover) tag?.firstArtwork?.binaryData else null
+            // 主封面**只取一次**：`hasCover` 需要知道「有没有图」，
+            // 而 withCover 只决定「要不要把字节读出来」。此前分两处各调一次
+            // frontCoverArtwork（它会遍历 artworkList 并写两条诊断日志），
+            // 同一首歌的封面被重复解析。
+            val coverArt = frontCoverArtwork(tag)
+            val artwork = if (withCover) coverArt?.binaryData else null
             if (artwork != null && artwork.isNotEmpty()) {
                 CoverStore.put(path, artwork)
             }
@@ -422,17 +495,8 @@ object TrackReader {
                     replayGainAlbumGain = gain.albumGain,
                     replayGainAlbumPeak = gain.albumPeak,
                     readable = true,
-                    hasCover =
-                        artwork != null ||
-                            run {
-                                val any =
-                                    try {
-                                        tag?.firstArtwork?.binaryData
-                                    } catch (_: Throwable) {
-                                        null
-                                    }
-                                any != null
-                            },
+                    // 复用上面已解析出的那张，不再重复遍历 artworkList
+                    hasCover = coverArt != null,
                 ).let { track -> mergeRiffInfo(file, track) }
         } catch (t: Throwable) {
             Diag.log("read: 读文件失败 ${file.name} ${t.javaClass.simpleName}")

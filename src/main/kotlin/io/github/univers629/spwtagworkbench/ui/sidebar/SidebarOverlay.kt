@@ -71,9 +71,23 @@ import io.github.univers629.spwtagworkbench.ui.icons.IconChevronRight
 import io.github.univers629.spwtagworkbench.ui.rememberHostPalette
 import io.github.univers629.spwtagworkbench.ui.space.CoverThumb
 
-/** 侧栏自身的开合。只控制这一个面板，不控制任何页面显隐。 */
-private object SidebarUi {
+/**
+ * 侧栏自身的开合。只控制这一个面板，不控制任何页面显隐。
+ *
+ * 可见性从 `private` 放开到 `internal`：顶部标题栏的召唤按钮也要能开合它
+ * （下拉里选「全局侧边栏」），否则两条入口会各自维护一份状态。
+ */
+internal object SidebarUi {
     var open by mutableStateOf(false)
+
+    /** 供外部入口（标题栏召唤按钮）开合侧栏，语义与悬浮按钮一致。 */
+    fun toggle() {
+        open = !open
+    }
+
+    fun close() {
+        open = false
+    }
 }
 
 /**

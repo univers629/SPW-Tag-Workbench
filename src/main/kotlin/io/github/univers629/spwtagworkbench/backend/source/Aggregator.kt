@@ -53,26 +53,209 @@ class Aggregator(
      * 第 2 条以前漏了——`isSourceEnabled` 只在界面里被读，backend 从没消费过，
      * 于是关掉源只改了勾选状态、搜索照打。
      */
-    private fun usableSources(capability: Capability): List<MusicSource> =
-        sources.filter {
+    private fun usableSources(capability: Capability): List<MusicSource> {
+        // 源开关变过一次就清空检索缓存：否则重新启用的源会拿到停用前的旧结果
+        if (io.github.univers629.spwtagworkbench.core.Settings
+                .consumeSourceToggle()
+        ) {
+            invalidateSearchCache()
+        }
+        return sources.filter {
             it.supports(capability) &&
                 io.github.univers629.spwtagworkbench.core.Settings
                     .isSourceEnabled(it.id)
         }
+    }
 
-    /** 单源超时：超时算失败，不阻塞其它源。 */
-    private val searchTimeoutMs = 9000L
+    /** 检索结果复用时长：同一曲目在封面 / 歌词 / 艺术家 / 批量匹配之间共用一次检索。 */
+    private val searchCacheTtlMs = 5 * 60 * 1000L
+
+    /** 空结果的复用时长：短一些，源临时返回空时不至于十分钟拿不到候选。 */
+    private val emptyCacheTtlMs = 30 * 1000L
+
+    /** 缓存条目上限：超出后淘汰写入时间最早的一条，避免长时间浏览持续累积。 */
+    private val SEARCH_CACHE_MAX_ENTRIES = 300
+
+    private class CachedSearch(
+        val at: Long,
+        val result: SourceResult,
+    )
+
+    /** 键 = 源 ID + 关键词；值 = 已完成的检索结果。 */
+    private val searchCache = java.util.concurrent.ConcurrentHashMap<String, CachedSearch>()
+
+    /** 同一源同一关键词的并发请求合并成一个：后来的等前一个的结果。 */
+    private val searchInflight =
+        java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<SourceResult>>()
+
+    /** 缓存命中次数，供日志确认复用效果。 */
+    private val searchHits = java.util.concurrent.atomic
+        .AtomicInteger()
+
+    fun searchCacheHits(): Int = searchHits.get()
+
+    /** 写入缓存，超出上限时淘汰最旧的一条。 */
+    private fun cachePut(
+        key: String,
+        result: SourceResult,
+    ) {
+        searchCache[key] = CachedSearch(System.currentTimeMillis(), result)
+        if (searchCache.size <= SEARCH_CACHE_MAX_ENTRIES) return
+        val oldest = searchCache.entries.minByOrNull { it.value.at } ?: return
+        searchCache.remove(oldest.key)
+        Diag.log("cache evict: 条目超过 $SEARCH_CACHE_MAX_ENTRIES，淘汰最旧一条")
+    }
+
+    /** 当前缓存条目数（诊断与停用日志用）。 */
+    fun searchCacheSize(): Int = searchCache.size
+
+    /**
+     * 检索缓存键。
+     *
+     * **必须覆盖全部影响结果的输入**。只拼 `keyword` 不够：带专辑时
+     * `keyword` 是「专辑 + 艺人」、不含曲名（见 [SearchQuery.keyword]），
+     * 同一张专辑的每首歌都会落到同一个键上。
+     *
+     * 撞键的后果不是「少发一次请求」，而是**串歌**：命中后拿到的是上一首的候选，
+     * 调用方却按当前曲目打分（[CandidateScoring.level]）甚至直接取用 ——
+     * 逐字歌词会显示成上一首的，回放增益会被写进错误的文件。
+     */
+    private fun cacheKey(
+        sourceId: String,
+        query: SearchQuery,
+    ): String =
+        buildString {
+            append(sourceId).append('|')
+            append(query.keyword).append('|')
+            append(query.title).append('|')
+            append(query.artist).append('|')
+            append(query.album).append('|')
+            append(query.durationMs)
+        }
+
+    /**
+     * 只读缓存：命中且未过期则返回已有结果，不发起任何请求。
+     *
+     * 与 [cachedSearch] 用同一个键函数，并复用同一套 TTL 判定 ——
+     * 否则只读路径会把已过期的条目当成新鲜结果用。
+     */
+    fun cachedResult(
+        sourceId: String,
+        query: SearchQuery,
+    ): SourceResult? {
+        val key = cacheKey(sourceId, query)
+        val entry = searchCache[key] ?: return null
+        val ttl = if (entry.result.candidates.isEmpty()) emptyCacheTtlMs else searchCacheTtlMs
+        if (System.currentTimeMillis() - entry.at > ttl) {
+            searchCache.remove(key, entry)
+            return null
+        }
+        return entry.result
+    }
+
+    /** 清空检索缓存：源开关变化、插件停用时调用。 */
+    fun invalidateSearchCache() {
+        searchCache.clear()
+    }
+
+    private fun searchKey(
+        source: MusicSource,
+        query: SearchQuery,
+    ): String = cacheKey(source.id, query)
+
+    /**
+     * 带缓存与单飞的单源检索。
+     *
+     * 四个界面（批量匹配、歌词页、封面页、艺术家页）对同一首歌发的是同一个关键词，
+     * 因此只有第一次真正请求源，其余命中缓存；并发请求合并等待同一个结果。
+     * 失败结果不缓存——否则一次超时或限流会被固化十分钟。
+     */
+    private suspend fun cachedSearch(
+        source: MusicSource,
+        query: SearchQuery,
+        timeoutMs: Long,
+    ): SourceResult {
+        val key = searchKey(source, query)
+        val now = System.currentTimeMillis()
+        searchCache[key]?.let { entry ->
+            val ttl = if (entry.result.candidates.isEmpty()) emptyCacheTtlMs else searchCacheTtlMs
+            if (now - entry.at <= ttl) {
+                Diag.log("cache hit: ${source.label}「${query.keyword.take(24)}」")
+                searchHits.incrementAndGet()
+                return entry.result
+            }
+            searchCache.remove(key, entry)
+        }
+        while (true) {
+            val inflight = searchInflight[key]
+            if (inflight != null) {
+                Diag.log("cache wait: ${source.label}「${query.keyword.take(24)}」")
+                // 等待者也要有自己的超时，否则 owner 卡住时它会一直挂着。
+                //
+                // 与音源那层不同，这里**能**真正生效：`await()` 是可挂起点，
+                // `withTimeoutOrNull` 会在超时时取消等待（阻塞 IO 那层则拦不住）。
+                //
+                // 预算比 owner 多 [WAITER_TIMEOUT_MARGIN_MS]：owner 自己的
+                // `withTimeoutOrNull(timeoutMs)` 到点后会返回失败结果并完成
+                // deferred，等待者应当有机会拿到那份结果（而非抢先判超时）。
+                // 这里**不**移除 inflight 条目：它归 owner 所有，由 owner 的
+                // finally 清理；等待者提前退出不应影响后续调用方继续等同一结果。
+                return try {
+                    withTimeoutOrNull(timeoutMs + WAITER_TIMEOUT_MARGIN_MS) { inflight.await() }
+                        ?: SourceResult(source.id, source.label, failure = "等待合并请求超时")
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    SourceResult(source.id, source.label, failure = t.javaClass.simpleName)
+                }
+            }
+            val deferred = kotlinx.coroutines.CompletableDeferred<SourceResult>()
+            if (searchInflight.putIfAbsent(key, deferred) != null) continue
+            try {
+                // 超时只对**可挂起**的代码有效：音源实现走 HttpURLConnection 的阻塞 IO，
+                // 没有挂起点，超时不会中断它（实测：outer=300ms 包住阻塞 900ms，实际 900ms 后正常返回）。
+                // 因此单次尝试的真实上限由 Http 自己的 connect/read 超时决定，
+                // 这里只是「超时后不再等待结果」的语义，不是硬中断。
+                val result =
+                    withTimeoutOrNull(timeoutMs) {
+                        try {
+                            source.search(query)
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (t: Throwable) {
+                            SourceResult(source.id, source.label, failure = t.javaClass.simpleName)
+                        }
+                    } ?: SourceResult(source.id, source.label, failure = "请求超时")
+                if (result.ok) {
+                    cachePut(key, result)
+                }
+                deferred.complete(result)
+                return result
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                deferred.completeExceptionally(e)
+                throw e
+            } catch (t: Throwable) {
+                deferred.completeExceptionally(t)
+                throw t
+            } finally {
+                searchInflight.remove(key)
+            }
+        }
+    }
 
     /**
      * 搜索。
      *
      * @param capability 只请求声明了该能力的源（能力声明必须被尊重）
-     * @param perSourceTimeoutMs 单源超时；超时只影响该源，不阻塞整体
+     * @param perSourceTimeoutMs 单源超时；超时只影响该源，不阻塞整体。
+     *   默认 [SOURCE_TIMEOUT_MS]；传入值同样必须大于
+     *   [io.github.univers629.spwtagworkbench.backend.net.Http.SOURCE_BUDGET_MS]，
+     *   否则内层重试会被外层提前取消。
      */
     suspend fun search(
         query: SearchQuery,
         capability: Capability,
-        perSourceTimeoutMs: Long = 9000,
+        perSourceTimeoutMs: Long = SOURCE_TIMEOUT_MS,
     ): AggregateResult {
         val usable = usableSources(capability)
         if (usable.isEmpty()) {
@@ -101,14 +284,7 @@ class Aggregator(
                             if (excellent.get()) {
                                 return@async SourceResult(source.id, source.label, failure = "")
                             }
-                            val result =
-                                withTimeoutOrNull(perSourceTimeoutMs) {
-                                    try {
-                                        source.search(query)
-                                    } catch (t: Throwable) {
-                                        SourceResult(source.id, source.label, failure = t.javaClass.simpleName)
-                                    }
-                                } ?: SourceResult(source.id, source.label, failure = "请求超时")
+                            val result = cachedSearch(source, query, perSourceTimeoutMs)
                             // 拿到结果立刻判定：够好就置位，让尚未开始的源直接跳过
                             if (hasExcellent(query, result)) excellent.set(true)
                             result
@@ -194,18 +370,7 @@ class Aggregator(
         coroutineScope {
             usable.forEach { source ->
                 launch(Dispatchers.IO) {
-                    val outcome =
-                        try {
-                            withTimeoutOrNull(searchTimeoutMs) { source.search(query) }
-                                ?: SourceResult(source.id, source.label, failure = "超时")
-                        } catch (t: Throwable) {
-                            SourceResult(
-                                source.id,
-                                source.label,
-                                failure =
-                                    t.javaClass.simpleName + ": " + (t.message ?: "").take(40),
-                            )
-                        }
+                    val outcome = cachedSearch(source, query, SOURCE_TIMEOUT_MS)
                     val items =
                         outcome.candidates
                             .map { candidate ->
@@ -295,7 +460,7 @@ class Aggregator(
         query: SearchQuery,
         rank: GroupRank = GroupRank.TITLE,
     ): SourceGroup? {
-        val result = withTimeoutOrNull(searchTimeoutMs) { source.search(query) }
+        val result = cachedSearch(source, query, SOURCE_TIMEOUT_MS)
         val candidates = result?.candidates.orEmpty()
         // 众数专辑只在按专辑检索时有意义；按曲名检索的结果分散在多张专辑上
         val targetAlbum =
@@ -331,10 +496,44 @@ class Aggregator(
             weight = source.weight,
             items = truncate(items),
             failure = result?.failure?.ifBlank { null },
+            albumTarget = targetAlbum,
         )
     }
 
     companion object {
+        /**
+         * 外层等待预算比 [io.github.univers629.spwtagworkbench.backend.net.Http]
+         * 内部预算多出的余量，单位毫秒。
+         *
+         * `Http.get` 自己会在 `SOURCE_BUDGET_MS` 内收口（含重试），但一次请求除了
+         * 网络本身还要经过参数拼装、JSON 解析、候选构造。余量留给这些步骤，
+         * 否则外层会在内层**正要**返回结果时先判超时，把一次成功当失败。
+         */
+        const val SOURCE_TIMEOUT_MARGIN_MS = 1_000L
+
+        /**
+         * 单源检索超时：`Http` 的预算 + 余量。
+         *
+         * **从 [io.github.univers629.spwtagworkbench.backend.net.Http.SOURCE_BUDGET_MS]
+         * 推导，不写死**——两者是同一笔预算的两端。旧代码在这里写死 9000，
+         * 内层预算一旦调大就会「外层先取消、内层还在跑」，改一处忘一处。
+         *
+         * 注意它**不是硬中断**：音源实现走 `HttpURLConnection` 的阻塞 IO，
+         * 没有挂起点，`withTimeoutOrNull` 无法打断它（实测 `outer=300ms` 包住
+         * 阻塞 900ms 时，实际耗时 900ms 并正常返回）。真正的单次耗时上限由
+         * `Http` 自己保证；这里只决定「超时后不再等待结果」。
+         */
+        const val SOURCE_TIMEOUT_MS =
+            io.github.univers629.spwtagworkbench.backend.net.Http.SOURCE_BUDGET_MS + SOURCE_TIMEOUT_MARGIN_MS
+
+        /**
+         * 单飞（single-flight）等待者比 owner 多等的余量，单位毫秒。
+         *
+         * owner 到点后会把失败结果写进 `deferred` 并完成它，等待者多等这一小段
+         * 才能拿到那份结果；否则两边同时超时，等待者会多记一次失败。
+         */
+        const val WAITER_TIMEOUT_MARGIN_MS = 2_000L
+
         /** 每源最多保留几条候选（界面每源只列 5 条，多留只是拖慢排序）。 */
         const val MAX_PER_SOURCE = 5
 
@@ -457,6 +656,15 @@ data class SourceGroup(
     val weight: Int,
     val items: List<GroupedCandidate>,
     val failure: String? = null,
+    /**
+     * 该源按专辑检索时解析出的目标专辑（非按专辑检索时为 null）。
+     *
+     * 由本对象在**排序时**一并算出并随结果带出，调用方**不得重算**：
+     * 这里用的是排序前的全部候选，而调用方拿到的是截断后的 [items]，
+     * 两次在**不同输入**上算众数会得到不同答案 —— 排序特意提到前面的候选
+     * 会被按另一个众数过滤掉，实测单源 5 条只留 1 条。
+     */
+    val albumTarget: String? = null,
 )
 
 /** 一个源里的一条候选，带匹配等级。 */

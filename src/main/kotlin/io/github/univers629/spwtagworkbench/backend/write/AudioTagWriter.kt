@@ -163,9 +163,18 @@ object AudioTagWriter {
                 writeId3Prefix(temp.toFile(), patch, effCover, effCoverType)
                 verifyId3Tag(Id3v2.read(temp.toFile()), patch, effCover, effCoverType)
                 Id3v1.sync(temp.toFile(), patch)
-            } else if (multiArtist.isNotEmpty() && container == ContainerKind.MP4) {
-                // MP4 只有一套 covr，放不下第二张艺术家图
-                return WriteOutcome.failure(path, APE_SINGLE_ARTWORK_MESSAGE)
+            } else if (container == ContainerKind.MPC && Id3v2.read(temp.toFile()) != null) {
+                // 带 ID3v2 前缀的 MPC：只重写尾部 APEv2 会让主标签区仍是旧值
+                // （优先读 ID3v2 的播放器永远显示旧标签）。与 TTA 同一处理：
+                // 重写前缀里的 ID3v2，尾部 APEv2 保持原样。
+                if (multiArtist.isNotEmpty()) return WriteOutcome.failure(path, MULTI_ARTIST_UNSUPPORTED)
+                writeId3Prefix(temp.toFile(), patch, effCover, effCoverType)
+                verifyId3Tag(Id3v2.read(temp.toFile()), patch, effCover, effCoverType)
+                Id3v1.sync(temp.toFile(), patch)
+            } else if (artistCovers.isNotEmpty() && container == ContainerKind.MP4) {
+                // MP4 只有一套 covr 且不带图片类型：写艺术家图会顶掉专辑封面，
+                // 播放器与主界面都会把它当成封面显示。
+                return WriteOutcome.failure(path, Mp4Probe.SINGLE_ARTWORK_MESSAGE)
             } else if (container.isApeV2) {
                 // APEv2（APE / WV / TAK / TTA / MPC）：标签在文件尾部，只重写尾部即可。
                 // 这类容器只有一套封面，写艺术家图会顶掉专辑封面，直接拒绝。
@@ -177,8 +186,13 @@ object AudioTagWriter {
             } else {
                 applyTo(temp.toFile(), patch, effCover, effCoverType, multiArtist)
                 verify(temp.toFile(), patch, effCover, effCoverType, multiArtist)
-                // MP3 等容器常同时带 ID3v1：同步它，避免播放器读到旧值
-                Id3v1.sync(temp.toFile(), patch)
+                // ID3v1 是 MPEG 音频（MP3）的尾部标签格式，只对 MP3 同步：
+                // [Id3v1.sync] 认「最后 128 字节以 TAG 开头」为标签，空标签时直接截尾 128 字节。
+                // 对 FLAC / OGG / WAV / AIFF / DSF 这些不定义 ID3v1 的容器，
+                // 末尾恰好出现 "TAG" 的概率虽低，一旦命中就是静默截掉 128 字节音频。
+                if (container == ContainerKind.MP3) {
+                    Id3v1.sync(temp.toFile(), patch)
+                }
             }
 
             // 5. 先删后改名
@@ -214,10 +228,11 @@ object AudioTagWriter {
                 ok = true,
                 message =
                     buildString {
-                        if (cover != null) {
-                            append(L10n.t("status.wroteFieldsCover", fields.size))
-                        } else {
-                            append(L10n.t("status.wroteFields", fields.size))
+                        when {
+                            cover != null -> append(L10n.t("status.wroteFieldsCover", fields.size))
+                            fields.isNotEmpty() -> append(L10n.t("status.wroteFields", fields.size))
+                            artistCovers.isNotEmpty() -> append(L10n.t("status.wroteArtistCovers", artistCovers.size))
+                            else -> append(L10n.t("status.wroteFields", fields.size))
                         }
                         if (!refreshed) append(L10n.t("status.hostRefreshSuffix"))
                     },
@@ -1159,4 +1174,113 @@ object AudioTagWriter {
         cover: CoverArt,
         pictureType: Int = PICTURE_FRONT_COVER,
     ): WriteOutcome = write(track, TagPatch(), cover = cover, coverType = pictureType)
+
+    /**
+     * 可删改内嵌图片的容器。
+     *
+     * 只列走 jaudiotagger 通用写入路径的容器：FLAC / MP3 / OGG / AIFF / DSF / WAV。
+     * 其余容器各有独立的标签写入路径（AAC 裸流与 DFF 走 ID3 前缀、Opus 走 OpusTags、
+     * TTA 与 APEv2 系走尾部标签、MP4 走 covr、WMA 走 ASF 对象），图片删改尚未在
+     * 这些路径上实现，一律拒绝，不交给通用路径试错。
+     *
+     * 用显式白名单而不是「排除若干项」：未知容器交给 jaudiotagger 会抛异常，
+     * 虽不损坏文件，但错误信息与真实的「不支持」不符。
+     */
+    private val PICTURE_EDITABLE: Set<ContainerKind> =
+        setOf(
+            ContainerKind.FLAC,
+            ContainerKind.MP3,
+            ContainerKind.OGG,
+            ContainerKind.AIFF,
+            ContainerKind.DSF,
+            ContainerKind.WAV,
+        )
+
+    /**
+     * 删除指定序号的内嵌图片。
+     *
+     * @param index 图片在文件中的顺序号，与信息页展示的序号一致
+     * @param expectedType 期望的图片类型（-1 表示不校验），用于挡住「界面列表已过期」的删除
+     * @param expectedSize 期望的字节数（-1 表示不校验）
+     */
+    fun removePicture(
+        path: String,
+        index: Int,
+        expectedType: Int = -1,
+        expectedSize: Int = -1,
+    ): WriteOutcome {
+        val target = File(path)
+        if (!target.isFile) return WriteOutcome.failure(path, L10n.t("err.fileUnreadable"))
+        val container = ContainerKind.detect(target)
+        if (container !in PICTURE_EDITABLE) return WriteOutcome.failure(path, L10n.t("info.deleteUnsupported"))
+
+        HostBridge.releasePlaybackFor(path)
+        val targetPath = target.toPath()
+        val parent =
+            targetPath.toAbsolutePath().parent
+                ?: return WriteOutcome.failure(path, L10n.t("status.noWritableFile"))
+        val attributes = snapshotAttributes(targetPath)
+        val extension = target.name.substringAfterLast('.', missingDelimiterValue = "")
+        val suffix = if (extension.isEmpty()) ".tmp" else ".$extension"
+        val temp =
+            try {
+                Files.createTempFile(parent, ".${target.name}$TEMP_INFIX", suffix)
+            } catch (t: Throwable) {
+                return WriteOutcome.failure(path, describe(t))
+            }
+
+        var replaced = false
+        try {
+            Files.copy(targetPath, temp, StandardCopyOption.REPLACE_EXISTING)
+            makeWritable(temp)
+            val audio = AudioFileIO.read(temp.toFile())
+            val tag = audio.tag ?: return WriteOutcome.failure(path, L10n.t("info.noPictures"))
+            val pictures = runCatching { tag.artworkList }.getOrNull().orEmpty()
+            if (index !in pictures.indices) return WriteOutcome.failure(path, L10n.t("info.noPictures"))
+            // 界面按序号发起删除；若列表在此期间已变化（重复点击、别处写入），
+            // 序号会指向另一张图。校验类型与字节数，不一致就拒绝。
+            val targetPicture = pictures[index]
+            if (expectedType >= 0 && targetPicture.pictureType != expectedType) {
+                return WriteOutcome.failure(path, L10n.t("info.pictureChanged"))
+            }
+            if (expectedSize >= 0 && (targetPicture.binaryData?.size ?: 0) != expectedSize) {
+                return WriteOutcome.failure(path, L10n.t("info.pictureChanged"))
+            }
+            val kept = pictures.filterIndexed { i, _ -> i != index }
+            tag.deleteArtworkField()
+            kept.forEach { addArtwork(tag, it) }
+            AudioFileIO.write(audio)
+
+            makeWritable(targetPath)
+            replaceByDeleteThenRename(targetPath, temp)
+            replaced = true
+            restoreAttributes(targetPath, attributes)
+            CoverStore.invalidate(path)
+            val refreshed = HostBridge.refreshLibrary("删除图片 ${target.name}")
+            Diag.log("write ok: ${target.name} 删除第 ${index + 1} 张图片，剩余 ${kept.size} 张")
+            return WriteOutcome(
+                path = path,
+                ok = true,
+                message =
+                    buildString {
+                        append(L10n.t("info.deletedPicture", index + 1))
+                        if (!refreshed) append(L10n.t("status.hostRefreshSuffix"))
+                    },
+                hostRefreshed = refreshed,
+            )
+        } catch (t: Throwable) {
+            val message = describe(t)
+            Diag.log("write fail: ${target.name} 删除图片 -> $message")
+            return WriteOutcome.failure(path, message)
+        } finally {
+            if (!replaced) {
+                try {
+                    makeWritable(temp)
+                    Files.deleteIfExists(temp)
+                } catch (ignored: Throwable) {
+                    Diag.log("write: 临时文件清理失败 ${temp.fileName}")
+                }
+            }
+        }
+    }
 }

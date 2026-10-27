@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import io.github.univers629.spwtagworkbench.core.Card
 import io.github.univers629.spwtagworkbench.core.PanelDialog
 import io.github.univers629.spwtagworkbench.core.Salt
+import io.github.univers629.spwtagworkbench.core.StatusToast
 import io.github.univers629.spwtagworkbench.core.T
 import io.github.univers629.spwtagworkbench.core.TapChip
 import io.github.univers629.spwtagworkbench.core.Txt
@@ -62,6 +63,7 @@ import io.github.univers629.spwtagworkbench.ui.artist.ArtistPage
 import io.github.univers629.spwtagworkbench.ui.cover.CoverPage
 import io.github.univers629.spwtagworkbench.ui.icons.IconChevronLeft
 import io.github.univers629.spwtagworkbench.ui.icons.IconMusicNote
+import io.github.univers629.spwtagworkbench.ui.info.InfoPage
 import io.github.univers629.spwtagworkbench.ui.lyrics.LyricsPage
 import io.github.univers629.spwtagworkbench.ui.spectrum.SpectrumPage
 import io.github.univers629.spwtagworkbench.ui.timeline.TimelinePage
@@ -190,6 +192,15 @@ fun SpaceCanvas() {
             }
         }
 
+        // 全局操作状态提示：桌面与全部专题页共用一条，
+        // 「写入草稿」「保存」「匹配」等动作的反馈在哪个页面都看得到。
+        StatusToast(
+            modifier =
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 14.dp),
+        )
+
         // 专辑批量确认弹窗：**放在画布最上层**。
         // 桌面始终在树里、专题页盖在它之上，弹窗放在任一页面里都会被另一页挡住；
         // 这里作为根 Box 的最后一个子项，保证它压在全部页面之上，且只渲染一次。
@@ -249,6 +260,7 @@ private fun DetailPage(
         SpacePage.Lyrics -> LyricsPage(interactive)
         SpacePage.Spectrum -> SpectrumPage(interactive)
         SpacePage.Timeline -> TimelinePage(interactive)
+        SpacePage.Info -> InfoPage(interactive)
         SpacePage.Desk -> Unit
     }
 }

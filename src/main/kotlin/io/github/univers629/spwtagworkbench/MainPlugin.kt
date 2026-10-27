@@ -9,6 +9,7 @@ import com.xuncorp.spw.workshop.api.PluginContext
 import com.xuncorp.spw.workshop.api.PluginPermission
 import com.xuncorp.spw.workshop.api.SpwPlugin
 import com.xuncorp.spw.workshop.api.WorkshopApi
+import io.github.univers629.spwtagworkbench.backend.host.TitlebarDiscovery
 import io.github.univers629.spwtagworkbench.core.Diag
 import io.github.univers629.spwtagworkbench.core.HostLanguage
 import io.github.univers629.spwtagworkbench.core.PluginEnv
@@ -20,6 +21,10 @@ import io.github.univers629.spwtagworkbench.router.SpacePage
 import io.github.univers629.spwtagworkbench.router.SpaceRouter
 import io.github.univers629.spwtagworkbench.ui.HostPassthrough
 import io.github.univers629.spwtagworkbench.ui.PluginOverlay
+import io.github.univers629.spwtagworkbench.ui.titlebar.TitlebarEntry
+import io.github.univers629.spwtagworkbench.ui.titlebar.TitlebarHost
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 
 /**
  * 内容区接管 + 全局侧栏。
@@ -50,6 +55,12 @@ class MainPlugin(
      */
     private val navHandles = ArrayList<AutoCloseable>()
 
+    /** 插件动作快捷键句柄；宿主停用时会自动清理，[stop] 里主动注销。 */
+    private var shortcutHandle: AutoCloseable? = null
+
+    /** 顶部标题栏召唤按钮的句柄。 */
+    private var titlebarHandle: AutoCloseable? = null
+
     override fun start() {
         // 先绑定宿主给出的插件 ID：后面所有落数据目录的逻辑都依赖它
         PluginEnv.bind(pluginContext.pluginId)
@@ -74,7 +85,9 @@ class MainPlugin(
         if (canHook) {
             mount()
             registerHostNavigation()
+            registerTitlebarEntry()
         }
+        registerShortcut()
 
         // 字体：确认用的是宿主 MiSans，而不是系统默认
         io.github.univers629.spwtagworkbench.core.Host.sans
@@ -109,12 +122,18 @@ class MainPlugin(
         runCatching { replaceHandle?.close() }
         runCatching { appendHandle?.close() }
         runCatching { topLevelHandle?.close() }
+        runCatching { titlebarHandle?.close() }
         replaceHandle = null
         appendHandle = null
         topLevelHandle = null
-        // 主动注销宿主导航 hook：句柄一个不漏地关掉
+        titlebarHandle = null
+        // 清空宿主方法绑定：下次启用重新扫描，不复用旧句柄
+        TitlebarHost.clear()
+        // 主动注销宿主导航 hook 与快捷键：句柄一个不漏地关掉
         for (h in navHandles) runCatching { h.close() }
         navHandles.clear()
+        runCatching { shortcutHandle?.close() }
+        shortcutHandle = null
         Repo.shutdown()
         SpaceRouter.hideForHostNavigation()
     }
@@ -122,6 +141,43 @@ class MainPlugin(
     override fun delete() {}
 
     override fun update() {}
+
+    // ── 快捷键 ────────────────────────────────────────────────────────────────
+
+    /**
+     * 注册打开工作台的宿主快捷键。
+     *
+     * 注册后该动作出现在宿主的「快捷键」设置页，用户可自行改键或配置全局热键；
+     * 应用内默认 Ctrl+Alt+T。文本输入框聚焦时应用内键不触发，冲突键不触发。
+     *
+     * 需要 KEY_BINDINGS 权限，且必须在 [start] 线程内注册。
+     */
+    private fun registerShortcut() {
+        runCatching {
+            if (!WorkshopApi.manager.isPermissionGranted(PluginPermission.KEY_BINDINGS)) {
+                Diag.log("shortcut: 未授予 KEY_BINDINGS，跳过注册")
+                return
+            }
+            shortcutHandle =
+                WorkshopApi.manager.keyBindingManager.register(
+                    actionId = "open-workbench",
+                    title = L10n.t("shortcut.openWorkbench"),
+                    defaultShortcut =
+                        com.xuncorp.spw.workshop.api.ActionShortcut(
+                            java.awt.event.KeyEvent.VK_T,
+                            com.xuncorp.spw.workshop.api.ActionShortcut.CONTROL or
+                                com.xuncorp.spw.workshop.api.ActionShortcut.ALT,
+                        ),
+                    hasGlobal = true,
+                ) {
+                    // 回调可能不在界面线程：切到 EDT 再改 Compose 状态
+                    runCatching { javax.swing.SwingUtilities.invokeLater { openWorkbench() } }
+                }
+            Diag.log("shortcut: 已注册 open-workbench（默认 Ctrl+Alt+T，可在宿主快捷键设置中改键）")
+        }.onFailure { t ->
+            Diag.log("shortcut: 注册失败 ${t.javaClass.simpleName}: ${t.message.orEmpty().take(80)}")
+        }
+    }
 
     // ── 挂载 ──────────────────────────────────────────────────────────────────
 
@@ -202,6 +258,35 @@ class MainPlugin(
             Diag.log("mount: 顶层侧栏已注册（层级 A）")
         } else {
             Diag.log("mount: 顶层注册失败，侧栏退回应用页层（层级 B）")
+        }
+    }
+
+    /**
+     * **顶部标题栏召唤按钮**。
+     *
+     * 扫描宿主 jar（4 万多个 class）在后台线程执行，但本函数**会阻塞等待**结果：
+     * Hook 注册必须发生在宿主组合线程之前，因此只能同步取回点位。
+     * 代价是插件启动最多多等这次扫描（实测约 1~3 秒），
+     * 由 [TITLEBAR_DISCOVERY_TIMEOUT_MS] 封顶；超时即放弃顶部按钮。
+     *
+     * 失败容忍：顶部点位是纯结构推断，跨版本风险高于未混淆的类名。
+     * 任何一步对不上都只记日志，插件其余功能照常。
+     */
+    private fun registerTitlebarEntry() {
+        val position = TitlebarDiscovery.Position.fromKey(Settings.titlebarPosition)
+        runCatching {
+            val bound =
+                CompletableFuture
+                    .supplyAsync { TitlebarHost.bind(position) }
+                    .get(TITLEBAR_DISCOVERY_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            check(bound) { TitlebarHost.lastError ?: "bind failed" }
+            val anchor = checkNotNull(TitlebarHost.anchor) { "anchor unavailable" }
+            val inClass = checkNotNull(TitlebarHost.inClass) { "inClass unavailable" }
+            titlebarHandle = TitlebarEntry.register(anchor, inClass)
+            Diag.log("mount: 顶部召唤按钮已注册（position=${position.key}）")
+        }.onFailure { t ->
+            Diag.log("mount: 顶部召唤按钮不可用 ${t.javaClass.simpleName}: ${t.message.orEmpty().take(120)}")
+            titlebarHandle = null
         }
     }
 
@@ -365,10 +450,26 @@ class MainPlugin(
         /** 最多重试几轮；总预算约 24 秒。 */
         private const val REPLACE_MAX_ATTEMPTS = 4
 
+        /**
+         * 顶部按钮的结构发现预算。
+         *
+         * 扫描宿主 jar 实测约 1～3 秒；超时即放弃顶部按钮，
+         * 不让一个可选入口拖住整个插件启动。
+         */
+        private const val TITLEBAR_DISCOVERY_TIMEOUT_MS = 12_000L
+
         /** 设置页按钮入口。 */
         @JvmStatic
         fun openWorkbench() {
             SpaceRouter.open(SpacePage.Desk)
+        }
+
+        /** 设置页「快捷键设置」入口：宿主的快捷键管理页由用户侧打开，这里给出路径提示。 */
+        @JvmStatic
+        fun showShortcutHint() {
+            runCatching {
+                WorkshopApi.ui.toast(L10n.t("shortcut.hint"), WorkshopApi.Ui.ToastType.Success)
+            }
         }
 
         /**

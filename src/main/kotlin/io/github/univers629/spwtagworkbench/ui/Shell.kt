@@ -473,6 +473,14 @@ private fun WideToolbar(
                 onClick = { Repo.saveDrafts() },
                 enabled = dirty > 0,
             )
+            // 放弃全部草稿：预览制的配套出口。
+            // 摘要型动作（源侧回放增益等）只进草稿不落盘，没有这个入口就无法撤销；
+            // 与保存按钮同样常驻，无脏草稿时置灰。
+            ToolButton(
+                label = L10n.t("shell.discardAll"),
+                onClick = { Repo.discardAllDrafts() },
+                enabled = dirty > 0,
+            )
 
             Spacer(Modifier.width(8.dp))
             // 专题页入口：候选与预览都在展开页里做
@@ -503,6 +511,12 @@ private fun WideToolbar(
             }
             IconToolButton(onClick = { SpaceRouter.navigate(io.github.univers629.spwtagworkbench.router.SpacePage.Timeline) }) {
                 io.github.univers629.spwtagworkbench.ui.icons.IconTimeline(
+                    color = palette.textSecondary,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+            IconToolButton(onClick = { SpaceRouter.navigate(io.github.univers629.spwtagworkbench.router.SpacePage.Info) }) {
+                io.github.univers629.spwtagworkbench.ui.icons.IconInfo(
                     color = palette.textSecondary,
                     modifier = Modifier.fillMaxSize(),
                 )

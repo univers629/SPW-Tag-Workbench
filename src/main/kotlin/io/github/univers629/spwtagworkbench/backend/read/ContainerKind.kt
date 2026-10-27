@@ -54,6 +54,9 @@ enum class ContainerKind(
     val isApeV2: Boolean get() = tagSystem == TagSystem.APEV2
 
     companion object {
+        /** 探测文件头时读多少字节：够放 ID3v2 头（10）并留出音频首帧的余量。 */
+        private const val HEADER_PROBE = 64
+
         /** ASF（WMA）文件头的 GUID。 */
         private val ASF_GUID =
             byteArrayOf(
@@ -75,11 +78,30 @@ enum class ContainerKind(
                 0x6C,
             )
 
+        /**
+         * 识别容器：先按魔数，**判不出来时**才按扩展名兜底（见 [fallbackByName]）。
+         */
         fun detect(file: File): ContainerKind =
             try {
-                RandomAccessFile(file, "r").use { raf -> detect(raf) }
+                val byMagic = RandomAccessFile(file, "r").use { raf -> detect(raf) }
+                if (byMagic != UNKNOWN) byMagic else fallbackByName(file.name) ?: UNKNOWN
             } catch (_: Throwable) {
                 UNKNOWN
+            }
+
+        /**
+         * 魔数判不出来时的扩展名兜底。
+         *
+         * 只覆盖**确实没有魔数**的那几代 MusePack：SV4~SV6 的文件头直接是压缩流，
+         * `MP+` 到 SV7 才出现、`MPCK` 是 SV8 的事，除了扩展名没有可依赖的判据
+         * （实测样本 `sv4_header.mpc` 前 4 字节是 `C1 27 20 00`，就是压缩数据）。
+         * 其余扩展名一律不兜底：扩展名能被改错，不能当通用判据 ——
+         * 判不出来则报告「未知容器」，优于按错的标签体系去读写。
+         */
+        private fun fallbackByName(fileName: String): ContainerKind? =
+            when (fileName.substringAfterLast('.', "").lowercase()) {
+                "mpc", "mp+" -> MPC
+                else -> null
             }
 
         private fun detect(raf: RandomAccessFile): ContainerKind {
@@ -110,18 +132,23 @@ enum class ContainerKind(
             }
         }
 
-        /** `ID3` 开头：MP3 最常见，MPC 也可能带 ID3v2 头。 */
+        /**
+         * `ID3` 开头：MP3 最常见，MPC 也可能带 ID3v2 头。
+         *
+         * **必须校验 ID3v2 头**：`ID3` 只是三个字节，任意文本也可能与之相同
+         * （实测样本 `almostempty.mpc` 内容就是 `ID3 dsfdsfds MP+`）。
+         * 头不合法时返回 [UNKNOWN]，交给扩展名兜底，不能默认当 MP3 ——
+         * 否则容器布局会按错的长度画出不存在的 ID3 块。
+         */
         private fun id3Kind(raf: RandomAccessFile): ContainerKind {
-            val probe = ByteArray(64)
+            val probe = ByteArray(HEADER_PROBE)
             raf.seek(0)
-            val n = raf.read(probe, 0, 64)
-            if (n < 10) return MP3
-            val size =
-                ((probe[6].toInt() and 0x7F) shl 21) or
-                    ((probe[7].toInt() and 0x7F) shl 14) or
-                    ((probe[8].toInt() and 0x7F) shl 7) or
-                    (probe[9].toInt() and 0x7F)
-            val after = 10L + size
+            val n = raf.read(probe, 0, HEADER_PROBE)
+            if (n < Id3v2.HEADER_SIZE) return UNKNOWN
+            val header = Id3v2.header(probe) ?: return UNKNOWN
+            // 声明的标签长度必须落在文件内：否则「跳过标签读音频首帧」无从谈起
+            if (header.totalSize > raf.length()) return UNKNOWN
+            val after = header.totalSize.toLong()
             // 跳过 ID3v2 后看音频首帧：ADTS 同步字 → AAC 裸流；MP+/MPCK → MPC
             if (after + 4 <= raf.length()) {
                 raf.seek(after)

@@ -82,7 +82,7 @@ ktlint {
 spmod {
     PluginClass = "io.github.univers629.spwtagworkbench.MainPlugin"
     PluginId = "io.github.univers629.spwtagworkbench"
-    PluginVersion = "1.3.3"
+    PluginVersion = "1.4.0"
     PluginProvider = "univers629"
     PluginName = "音乐标签工作台"
     PluginDescription = "在线批量匹配封面和逐字歌词，逐字歌词打轴，查看歌曲频谱图，编辑、预览音乐标签信息"
@@ -91,6 +91,7 @@ spmod {
     PluginPermissions =
         listOf(
             PluginPermission.CLASS_TRANSFORM,
+            PluginPermission.KEY_BINDINGS,
             PluginPermission.LIBRARY_READ,
             PluginPermission.LIBRARY_WRITE,
         )

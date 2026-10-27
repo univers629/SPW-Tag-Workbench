@@ -17,6 +17,35 @@ object Settings {
         private set
 
     /**
+     * 是否在宿主顶部标题栏显示插件的「召唤按钮」。
+     *
+     * 由宿主「模组管理」页的 `titlebar.entry` 开关控制；关闭时按钮不绘制，
+     * 但注册仍然保留 —— 反复装卸钩子比「画个空按钮」更容易出问题。
+     */
+    var titlebarEntry by mutableStateOf(true)
+        private set
+
+    /**
+     * 顶部按钮排在宿主 Quick 按钮的哪一侧：`left`（默认）或 `right`。
+     *
+     * 由宿主「模组管理」页的 `titlebar.position` 列表项控制。这是**插入点**的选择，
+     * 不是像素坐标：宿主标题栏是固定结构的 Row，插件只能挑「挂在哪个兄弟之后」。
+     */
+    var titlebarPosition by mutableStateOf("left")
+        private set
+
+    /**
+     * 顶部按钮**点击时做什么**：`workbench`（默认）或 `sidebar`。
+     *
+     * 由宿主「模组管理」页的 `titlebar.action` 列表项控制。
+     *
+     * 按钮本身**没有下拉菜单**：单击就执行这里选定的动作。
+     * 选择放在宿主设置页，而不是点开菜单再选 —— 标题栏按钮应当一键直达。
+     */
+    var titlebarAction by mutableStateOf(TITLEBAR_ACTION_WORKBENCH)
+        private set
+
+    /**
      * 主视图是否显示封面下方那两个「艺术家封面」小槽。
      *
      * 由宿主「模组管理」页的 `view.showArtistSlots` 开关控制——插件的所有设置项
@@ -64,11 +93,19 @@ object Settings {
 
     fun isSourceEnabled(id: String): Boolean = sourceEnabled[id] ?: true
 
+    /** 源开关变化标记：聚合器在下一次取可用源时消费并清空检索缓存。 */
+    private val sourceToggleFlag = java.util.concurrent.atomic
+        .AtomicBoolean(false)
+
+    /** 取出并清除「源开关已变化」标记。 */
+    fun consumeSourceToggle(): Boolean = sourceToggleFlag.getAndSet(false)
+
     fun setSourceEnabled(
         id: String,
         enabled: Boolean,
     ) {
         sourceEnabled[id] = enabled
+        sourceToggleFlag.set(true)
         runCatching {
             val config = helper ?: return@runCatching
             config.set("sources.$id.enabled", enabled)
@@ -115,6 +152,24 @@ object Settings {
             runCatching {
                 config.get<Boolean>("sidebar.rail", true) ?: true
             }.getOrDefault(true)
+        titlebarEntry =
+            runCatching {
+                config.get<Boolean>(TITLEBAR_ENTRY_KEY, true) ?: true
+            }.getOrDefault(true)
+        titlebarPosition =
+            runCatching {
+                when (config.get<String>(TITLEBAR_POSITION_KEY, "left") ?: "left") {
+                    "right" -> "right"
+                    else -> "left"
+                }
+            }.getOrDefault("left")
+        titlebarAction =
+            runCatching {
+                when (config.get<String>(TITLEBAR_ACTION_KEY, TITLEBAR_ACTION_WORKBENCH)) {
+                    TITLEBAR_ACTION_SIDEBAR -> TITLEBAR_ACTION_SIDEBAR
+                    else -> TITLEBAR_ACTION_WORKBENCH
+                }
+            }.getOrDefault(TITLEBAR_ACTION_WORKBENCH)
         showArtistSlots =
             runCatching {
                 config.get<Boolean>(SHOW_ARTIST_SLOTS_KEY, true) ?: true
@@ -143,4 +198,11 @@ object Settings {
     private const val SHOW_ARTIST_SLOTS_KEY = "view.showArtistSlots"
     private const val MATCHING_POLICY_KEY = "matching.policy"
     private const val ID3V2_VERSION_KEY = "tags.id3v2"
+    private const val TITLEBAR_ENTRY_KEY = "titlebar.entry"
+    private const val TITLEBAR_POSITION_KEY = "titlebar.position"
+    private const val TITLEBAR_ACTION_KEY = "titlebar.action"
+
+    /** `titlebar.action` 的取值：打开工作台（默认） / 开合侧边栏。 */
+    const val TITLEBAR_ACTION_WORKBENCH = "workbench"
+    const val TITLEBAR_ACTION_SIDEBAR = "sidebar"
 }

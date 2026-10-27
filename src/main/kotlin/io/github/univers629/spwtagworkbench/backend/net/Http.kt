@@ -32,6 +32,31 @@ object Http {
         val ok: Boolean get() = error.isEmpty() && status in 200..299
     }
 
+    /**
+     * 一次 `Http.get`（含全部重试）的**总预算**，单位毫秒。
+     *
+     * 单次尝试的真实最坏耗时是 `connectTimeout + readTimeout`（[request] 里两者
+     * 都设为同一个值），即 `2 × timeoutMs`；再加上重试次数，总最坏为
+     * `2 × timeoutMs × (retries + 1)`。各音源显式传 7000 / 8000 / 9000，
+     * 最坏会到 16~36 秒，远超任何合理的界面等待。
+     *
+     * **本常量是硬上限，由 [get] 自己执行**：每次尝试的上限取
+     * `min(调用方要求, 剩余预算 / 2)`（除以 2 是给 connect 与 read 各留一半），
+     * 因此总耗时被压在 [SOURCE_BUDGET_MS] 附近，不依赖调用方自觉。
+     *
+     * 为什么不靠外层超时兜底：音源实现走 `HttpURLConnection` 的**阻塞 IO**，
+     * 没有挂起点，`Aggregator` 的 `withTimeoutOrNull` **无法中断它**
+     * —— 实测 `outer=300ms` 包住阻塞 900ms 时实际耗时 900ms 且正常返回。
+     * 因此内层必须自己限时，外层超时只是「不再等待结果」，不是硬中断。
+     *
+     * 重试策略：首次快速失败（连接被重置、DNS 抖动、瞬时 5xx）时剩余预算充足，
+     * 第二次尝试会真的跑；首次已耗时到预算下限时直接放弃，不再空等。
+     */
+    const val SOURCE_BUDGET_MS = 7000L
+
+    /** 剩余预算低于此值就不再重试：一次注定来不及的尝试只会多等。 */
+    private const val MIN_RETRY_BUDGET_MS = 1200L
+
     fun get(
         url: String,
         query: Map<String, String> = emptyMap(),
@@ -40,16 +65,27 @@ object Http {
         retries: Int = 1,
     ): Response {
         val full = buildUrl(url, query)
+        val startedAt = System.nanoTime()
+
+        fun elapsedMs(): Long = (System.nanoTime() - startedAt) / 1_000_000
+
         var attempt = 0
         var lastError = ""
         while (attempt <= retries) {
             attempt++
-            val result = once(full, headers, timeoutMs)
+            // 每次尝试都必须落在剩余预算内。除以 2 是因为单次尝试会先 connect 再 read，
+            // 两者各自计时且各自取这个上限，所以「一次尝试」最坏占用 2 倍。
+            val remainingMs = SOURCE_BUDGET_MS - elapsedMs()
+            val attemptMs = minOf(timeoutMs, (remainingMs / 2).coerceAtLeast(1L))
+            val result = once(full, headers, attemptMs)
             if (result.ok) return result
             if (result.status in 400..499) return result
             lastError = result.error
-            if (attempt <= retries) {
-                Diag.log("http: 第 $attempt 次失败（${result.error.take(60)}），重试")
+            val leftAfter = SOURCE_BUDGET_MS - elapsedMs()
+            if (attempt <= retries && leftAfter >= MIN_RETRY_BUDGET_MS) {
+                Diag.log("http: 第 $attempt 次失败（${result.error.take(60)}），剩余 ${leftAfter}ms 预算，重试")
+            } else {
+                break
             }
         }
         return Response(status = -1, body = "", error = lastError.ifEmpty { "请求失败" })
@@ -69,7 +105,7 @@ object Http {
                 connection.readTimeout = timeoutMs.toInt()
                 connection.setRequestProperty("User-Agent", USER_AGENT)
                 if (connection.responseCode in 200..299) {
-                    connection.inputStream.use { it.readBytes() }
+                    readBoundedBytes(connection, url)
                 } else {
                     Diag.log("http: 下载 HTTP ${connection.responseCode} $url")
                     null
@@ -142,8 +178,7 @@ object Http {
 
                 val status = connection.responseCode
                 if (status in 200..299) {
-                    val body =
-                        connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                    val body = readBounded(connection)
                     Response(status, body)
                 } else {
                     Response(status, "", "源返回 HTTP $status")
@@ -157,6 +192,72 @@ object Http {
                     // 忽略
                 }
             }
+        }
+
+    /**
+     * 读取响应体，**限制总字节数**。
+     *
+     * 不设上限时，一个异常或被劫持的响应可以让 `readText()` 一直读到内存耗尽；
+     * 音源接口返回的是几百 KB 以内的 JSON，8MB 已远超正常用量。
+     * 超限即截断返回（JSON 解析会失败并记为「响应格式异常」），
+     * 不做无限读取。
+     */
+    private fun readBounded(connection: HttpURLConnection): String {
+        val limit = MAX_RESPONSE_BYTES
+        val out = java.io.ByteArrayOutputStream(minOf(64 * 1024, limit))
+        connection.inputStream.use { input ->
+            val buf = ByteArray(16 * 1024)
+            var total = 0
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                val room = limit - total
+                if (room <= 0) {
+                    Diag.log("http: 响应超过 ${limit / 1024}KB，已截断")
+                    break
+                }
+                val take = minOf(n, room)
+                out.write(buf, 0, take)
+                total += take
+                if (take < n) {
+                    Diag.log("http: 响应超过 ${limit / 1024}KB，已截断")
+                    break
+                }
+            }
+        }
+        return out.toString(Charsets.UTF_8.name())
+    }
+
+    /** 响应体上限：8MB。 */
+    private const val MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+    /** 封面（二进制）响应上限：16MB。图片远小于这个数量级。 */
+    private const val MAX_IMAGE_BYTES = 16 * 1024 * 1024
+
+    /**
+     * 读取二进制响应体，**限制总字节数**。
+     *
+     * 与 [readBounded] 同一个理由：封面的 URL 来自第三方音源，长度完全由对方决定。
+     * 不设上限时一个异常响应就能耗尽内存（`readBytes()` 会按声明的长度直接分配）。
+     * 超限直接放弃这次下载 —— 半张图没有意义，让候选列表继续往后替补。
+     */
+    private fun readBoundedBytes(
+        connection: HttpURLConnection,
+        url: String,
+    ): ByteArray? =
+        connection.inputStream.use { input ->
+            val out = java.io.ByteArrayOutputStream(64 * 1024)
+            val buf = ByteArray(16 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                out.write(buf, 0, n)
+                if (out.size() > MAX_IMAGE_BYTES) {
+                    Diag.log("http: 响应超过 ${MAX_IMAGE_BYTES / 1024 / 1024}MB，放弃 ${url.take(96)}")
+                    return@use null
+                }
+            }
+            out.toByteArray()
         }
 
     /**

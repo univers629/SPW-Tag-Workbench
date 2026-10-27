@@ -78,29 +78,42 @@ object ApeV2 {
             if (String(tag, Charsets.ISO_8859_1) == "TAG") id3v1 = 128
         }
         val searchEnd = fileLength - id3v1
-        val window = minOf(searchEnd, 256L * 1024)
-        if (window < FOOTER_SIZE) return null
-        val start = searchEnd - window
-        raf.seek(start)
-        val buf = ByteArray(window.toInt())
-        val read = raf.read(buf, 0, buf.size)
-        if (read < FOOTER_SIZE) return null
-        val text = String(buf, 0, read, Charsets.ISO_8859_1)
-        val footerAt = text.lastIndexOf(FOOTER)
-        if (footerAt < 0) return null
-        val size = u32(buf, footerAt + 12)
-        val count = u32(buf, footerAt + 16)
-        val flags = u32(buf, footerAt + 20)
-        if (size < FOOTER_SIZE || size > window) return null
-        val tagEnd = start + footerAt + FOOTER_SIZE
-        val tagStart = start + footerAt + FOOTER_SIZE - size
+        if (searchEnd < FOOTER_SIZE) return null
+
+        // 先从**文件末尾**读 32 字节尾部结构，取它自报的 size 精确定位标签区，
+        // 再按需读入。此前是在末尾 256KB 窗口里搜 "APETAGEX" 字符串，
+        // 两个后果：
+        //   1) 封面超过 ~256KB 的文件整体读不出标签（窗口里找不到尾部结构）；
+        //   2) 音频数据里若恰好出现 "APETAGEX" 字节序列，会被当成标签起点。
+        // 尾部结构按规范就在最后 32 字节，不需要搜索。
+        raf.seek(searchEnd - FOOTER_SIZE)
+        val footer = ByteArray(FOOTER_SIZE)
+        if (raf.read(footer, 0, FOOTER_SIZE) != FOOTER_SIZE) return null
+        if (String(footer, 0, 8, Charsets.ISO_8859_1) != FOOTER) return null
+
+        val size = u32(footer, 12)
+        val count = u32(footer, 16)
+        val flags = u32(footer, 20)
+        // `size` = 全部条目 + 尾部，**不含可选头部**（APEv2 规范）。
+        if (size < FOOTER_SIZE || size > searchEnd) return null
+
+        val tagEnd = searchEnd
+        // 条目区起点 = 末尾倒退 size
+        val itemsStart = tagEnd - size
+        val itemsEnd = tagEnd - FOOTER_SIZE
+        // 有头部时，头部紧贴在条目之前；audioEnd 要含头部，否则会把它当音频留下
         val hasHeader = (flags and FLAG_IS_HEADER) == 0L && (flags and FLAG_HAS_HEADER) != 0L
-        val itemsStart = tagStart
-        val itemsEnd = start + footerAt
+        val tagStart = if (hasHeader) itemsStart - FOOTER_SIZE else itemsStart
+        if (tagStart < 0 || itemsEnd < itemsStart) return null
+
+        val buf = ByteArray((tagEnd - tagStart).toInt())
+        raf.seek(tagStart)
+        if (raf.read(buf, 0, buf.size) < FOOTER_SIZE) return null
+
         val items = mutableListOf<Item>()
-        var p = (itemsStart - start).toInt()
-        val end = (itemsEnd - start).toInt()
-        repeat(count.toInt().coerceAtMost(100_000)) {
+        var p = (itemsStart - tagStart).toInt()
+        val end = (itemsEnd - tagStart).toInt()
+        repeat(count.toInt().coerceAtMost(MAX_ITEMS)) {
             if (p + 8 > end) return@repeat
             val valueLength = u32(buf, p).toInt()
             val itemFlags = u32(buf, p + 4).toInt()
@@ -116,7 +129,7 @@ object ApeV2 {
         }
         return Tag(
             items = items,
-            tagStart = if (hasHeader) tagStart - FOOTER_SIZE else tagStart,
+            tagStart = tagStart,
             tagEnd = tagEnd,
             hasHeader = hasHeader,
         )
@@ -126,6 +139,12 @@ object ApeV2 {
      * 把标签写到 [file] 末尾（覆盖已有 APEv2，保留其后的 ID3v1）。
      *
      * 调用方负责「在临时副本上操作」，因此这里直接截断重写，不需要原子性。
+     *
+     * **音频区按字节搬运，不整块读进内存**：APE / WV / TAK 常见 0.5~4GB，
+     * 读成 `ByteArray` 会占用同等内存，且 [Long] 到 [Int] 的转换对 ≥2GiB 的文件
+     * 会溢出成负数（抛异常）或回绕成小值 —— 后者更危险：`setLength` 会把临时副本
+     * 截断到几 MB，而回读校验只验标签、必然通过，于是截断后的文件被当成写入成功
+     * 替换原文件，音频永久丢失。
      */
     fun write(
         file: File,
@@ -155,19 +174,69 @@ object ApeV2 {
             }
             if (String(tail, 0, 3, Charsets.ISO_8859_1) == "TAG") id3v1 = tail
         }
-        val audioEnd = existing?.audioEnd ?: (file.length() - (id3v1?.size ?: 0))
-        val audio = ByteArray(audioEnd.toInt())
-        RandomAccessFile(file, "r").use { raf ->
-            raf.seek(0)
-            raf.read(audio, 0, audio.size)
-        }
-        RandomAccessFile(file, "rw").use { raf ->
-            raf.setLength(audio.size.toLong())
-            raf.seek(audio.size.toLong())
-            raf.write(tagBytes)
-            id3v1?.let { raf.write(it) }
+        // 音频区结束位置：优先用已解析的标签起点；解析不出标签时，
+        // 末尾若确实是 APEv2 尾部结构，也必须回推边界 —— 否则旧标签会被当成音频保留，
+        // 文件变成「音频 + 旧标签垃圾 + 新标签」，且回读只验末尾新标签、判定成功。
+        val withoutId3v1 = file.length() - (id3v1?.size ?: 0)
+        val audioEnd = existing?.audioEnd ?: trailingTagStart(file, withoutId3v1)
+
+        // 逐块搬运音频区：不做 Long→Int 转换，任意大小都安全
+        val source = RandomAccessFile(file, "r")
+        val target = RandomAccessFile(file, "rw")
+        try {
+            source.seek(0)
+            target.setLength(audioEnd)
+            target.seek(0)
+            val buf = ByteArray(COPY_CHUNK)
+            var remaining = audioEnd
+            while (remaining > 0) {
+                val want = minOf(buf.size.toLong(), remaining).toInt()
+                val n = source.read(buf, 0, want)
+                if (n <= 0) break
+                target.write(buf, 0, n)
+                remaining -= n
+            }
+            target.seek(audioEnd)
+            target.write(tagBytes)
+            id3v1?.let { target.write(it) }
+        } finally {
+            runCatching { source.close() }
+            runCatching { target.close() }
         }
     }
+
+    /** 搬运音频区的缓冲大小。 */
+    private const val COPY_CHUNK = 1 shl 20
+
+    /**
+     * 末尾是 APEv2 尾部结构时，回推出音频区结束位置；否则返回 [end]。
+     *
+     * 用于 [write] 里 [read] 失败（例如标签结构损坏到解析不出条目）的情形：
+     * 此时仍必须把旧标签区排除在音频之外，否则旧标签会被当成音频保留下来。
+     */
+    private fun trailingTagStart(
+        file: File,
+        end: Long,
+    ): Long {
+        val footerStart = end - FOOTER_SIZE
+        if (footerStart < 0) return end
+        val probe = ByteArray(FOOTER_SIZE)
+        RandomAccessFile(file, "r").use { raf ->
+            raf.seek(footerStart)
+            if (raf.read(probe, 0, FOOTER_SIZE) < FOOTER_SIZE) return end
+        }
+        if (String(probe, 0, 8, Charsets.ISO_8859_1) != FOOTER) return end
+        val size = u32(probe, 12)
+        val flags = u32(probe, 20)
+        if (size < FOOTER_SIZE || size > end) return end
+        val hasHeader = (flags and FLAG_IS_HEADER) == 0L && (flags and FLAG_HAS_HEADER) != 0L
+        val headerSize = if (hasHeader) FOOTER_SIZE.toLong() else 0L
+        val start = end - size - headerSize
+        return if (start < 0) end else start
+    }
+
+    /** 单个标签最多解析的条目数：防止损坏的 count 字段导致长时间循环。 */
+    private const val MAX_ITEMS = 100_000
 
     private fun buildItems(items: List<Item>): ByteArray {
         var size = 0

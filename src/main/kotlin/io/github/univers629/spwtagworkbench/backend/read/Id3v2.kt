@@ -59,6 +59,42 @@ object Id3v2 {
     /** 文本帧 ID（2.3 与 2.4 多数相同，年份字段不同）。 */
     fun yearFrameId(major: Int): String = if (major >= 4) "TDRC" else "TYER"
 
+    // ── 头 ──────────────────────────────────────────────────────────────────
+
+    /** 解析出的 ID3v2 头。 */
+    class Header(
+        val major: Int,
+        val revision: Int,
+        val flags: Int,
+        /** 标签体长度（不含 10 字节头）。 */
+        val bodySize: Int,
+    ) {
+        /** 整个标签占用的字节数（头 + 体）。 */
+        val totalSize: Int get() = HEADER_SIZE + bodySize
+    }
+
+    /**
+     * 解析 10 字节 ID3v2 头；不是合法头时返回 null。
+     *
+     * **「前三个字节是 ID3」不等于「这是一个 ID3v2 标签」**：实测样本
+     * `almostempty.mpc` 的内容就是 `ID3` + 一段输入的文字（`ID3 dsfdsfds MP+`）。
+     * 只看魔数就会把 `0x20` 当版本号、把 `s f d s` 当同步安全长度，得出
+     * 「ID3v2.32.100、两亿字节」这种明显失真的结果，容器布局卡据此画出一条
+     * 不存在的块。因此这里要求版本在 2..4、修订号不是 0xFF、
+     * 长度字段每个字节的最高位为 0（同步安全整数）。
+     *
+     * 调用方仍需自行确认 [Header.totalSize] 落在文件内。
+     */
+    fun header(head: ByteArray): Header? {
+        if (head.size < HEADER_SIZE || !hasMagic(head, 0)) return null
+        val major = head[3].toInt() and 0xFF
+        if (major !in 2..4) return null
+        val revision = head[4].toInt() and 0xFF
+        if (revision == 0xFF) return null
+        for (i in 6..9) if ((head[i].toInt() and 0x80) != 0) return null
+        return Header(major, revision, head[5].toInt() and 0xFF, syncsafe(head, 6))
+    }
+
     // ── 读 ──────────────────────────────────────────────────────────────────
 
     /**
@@ -71,9 +107,11 @@ object Id3v2 {
     fun read(file: File): Tag? =
         try {
             val head = readPrefix(file, HEADER_SIZE)
-            if (head == null || !hasMagic(head, 0)) return null
-            val total = HEADER_SIZE + syncsafe(head, 6)
-            val bytes = readPrefix(file, total) ?: return null
+            // 头不合法就不是 ID3v2 文件（可能只是恰好以 ID3 开头的其它内容）
+            val parsed = head?.let { header(it) } ?: return null
+            // 声明长度超出文件：标签被截断，不按半截解析（那会读出残缺帧）
+            if (parsed.totalSize > file.length()) return null
+            val bytes = readPrefix(file, parsed.totalSize) ?: return null
             readAt(bytes, 0)
         } catch (_: Throwable) {
             null

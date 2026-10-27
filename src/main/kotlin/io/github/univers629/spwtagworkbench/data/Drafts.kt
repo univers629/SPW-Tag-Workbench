@@ -178,6 +178,10 @@ object Drafts {
     ) {
         val image = persistImage(trackKey, bytes, "cover") ?: return
         val current = drafts[trackKey] ?: TrackDraft()
+        // 覆盖前先删掉被替换的旧图：persistImage 每次都会新建一个文件，
+        // 反复「写入草稿」而不回收旧图会在临时目录里留下无人引用的孤儿
+        // （依次试多张候选时最明显）。只删磁盘文件，内存内联图无文件可删。
+        dropImage(current.cover)
         put(trackKey, current.copy(cover = image))
     }
 
@@ -194,6 +198,8 @@ object Drafts {
         val image = persistImage(trackKey, bytes, "artist-$slotIndex") ?: return
         val current = drafts[trackKey] ?: TrackDraft()
         val covers = current.artistCovers.toMutableMap()
+        // 同上：覆盖该槽位前先回收旧文件
+        dropImage(covers[slotIndex])
         covers[slotIndex] = image
         put(trackKey, current.copy(artistCovers = covers))
     }
@@ -268,9 +274,14 @@ object Drafts {
     /** 删掉草稿引用的临时图片文件。 */
     private fun dropImages(draft: TrackDraft) {
         for (img in listOfNotNull(draft.cover) + draft.artistCovers.values) {
-            val p = img.path ?: continue
-            runCatching { File(p).delete() }
+            dropImage(img)
         }
+    }
+
+    /** 删掉单张草稿图片对应的临时文件；内存内联图（无 path）不做任何事。 */
+    private fun dropImage(image: DraftImage?) {
+        val p = image?.path ?: return
+        runCatching { File(p).delete() }
     }
 
     /** 清空整个临时目录（插件启动时调用，回收上次异常退出残留的文件）。 */
@@ -310,6 +321,23 @@ object Drafts {
         trackKey: String,
         field: TagField,
     ): String? = drafts[trackKey]?.fields?.get(field)
+
+    /**
+     * 某曲目在草稿里的 ReplayGain（音轨增益 + 峰值）。
+     *
+     * 读 [version] 建立 Compose 快照依赖：草稿变化要能让调用方重组，
+     * 否则暂存后界面不会刷新。
+     *
+     * @return 没有 ReplayGain 草稿时返回 null
+     */
+    fun replayGainDraft(trackKey: String): Pair<String, String>? {
+        version
+        if (trackKey.isEmpty()) return null
+        val fields = drafts[trackKey]?.fields ?: return null
+        val gain = fields[TagField.ReplayGainTrackGain]?.takeIf { it.isNotBlank() } ?: return null
+        val peak = fields[TagField.ReplayGainTrackPeak].orEmpty()
+        return gain to peak
+    }
 
     private fun put(
         trackKey: String,

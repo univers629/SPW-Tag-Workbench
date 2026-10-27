@@ -166,37 +166,76 @@ class NeteaseSource : MusicSource {
      */
     private suspend fun resolveArtistImage(artistId: String): String? {
         if (artistId.isBlank()) return null
-        artistImageCache[artistId]?.let { return it.ifBlank { null } }
+        cachedArtistImage(artistId)?.let { return it.ifBlank { null } }
 
         val mutex = artistImageLocks.computeIfAbsent(artistId) { Mutex() }
-        return mutex.withLock {
-            artistImageCache[artistId]?.let { return@withLock it.ifBlank { null } }
+        return try {
+            mutex.withLock {
+                cachedArtistImage(artistId)?.let { return@withLock it.ifBlank { null } }
 
-            val response =
-                runCatching {
-                    Http.get(
-                        url = "https://music.163.com/api/artist/$artistId",
-                        headers = headers,
-                        timeoutMs = 9000,
-                    )
-                }.getOrNull()
-            val url =
-                response
-                    ?.takeIf { it.ok }
-                    ?.let { Json.parse(it.body)?.obj("artist") }
-                    ?.let { coverUrl(it.str("img1v1Url")) ?: coverUrl(it.str("picUrl")) }
-                    .orEmpty()
+                val response =
+                    runCatching {
+                        Http.get(
+                            url = "https://music.163.com/api/artist/$artistId",
+                            headers = headers,
+                            timeoutMs = 9000,
+                        )
+                    }.getOrNull()
+                val url =
+                    response
+                        ?.takeIf { it.ok }
+                        ?.let { Json.parse(it.body)?.obj("artist") }
+                        ?.let { coverUrl(it.str("img1v1Url")) ?: coverUrl(it.str("picUrl")) }
+                        .orEmpty()
 
-            artistImageCache[artistId] = url
-            Diag.log("netease: 艺术家 $artistId 图片=${if (url.isBlank()) "无" else url.takeLast(28)}")
-            url.ifBlank { null }
+                putArtistImage(artistId, url)
+                Diag.log("netease: 艺术家 $artistId 图片=${if (url.isBlank()) "无" else url.takeLast(28)}")
+                url.ifBlank { null }
+            }
+        } finally {
+            // 锁只在「有并发」这一小段时间内需要：请求结束就移除，
+            // 否则每个出现过的 artistId 都会永久留下一个 Mutex 对象。
+            // 用 remove(key, value) 原子移除，避免误删并发场景下重建的新实例；
+            // 等待中的调用方已持有自己的引用，移除不影响它们继续加锁。
+            artistImageLocks.remove(artistId, mutex)
         }
     }
 
-    /** 艺术家 id → 艺人图地址；空串表示查过但没有。 */
-    private val artistImageCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    /** 读艺人图缓存（有界 LRU，需同步访问）。 */
+    private fun cachedArtistImage(artistId: String): String? = synchronized(artistImageCache) { artistImageCache[artistId] }
 
-    /** 艺术家 id → 该 id 的查询锁，保证同一 id 只发一次请求。 */
+    /** 写艺人图缓存（有界 LRU，需同步访问）。 */
+    private fun putArtistImage(
+        artistId: String,
+        url: String,
+    ) {
+        synchronized(artistImageCache) { artistImageCache[artistId] = url }
+    }
+
+    /** 艺人图缓存的条目上限。单条只是一个 URL 字符串，512 条约几十 KB。 */
+    private val MAX_ARTIST_IMAGE_ENTRIES = 512
+
+    /**
+     * 艺术家 id → 艺人图地址；空串表示查过但没有。
+     *
+     * **必须有上限**：条目随「浏览过多少艺人」增长，而本对象是常驻单例、
+     * 插件停用也不会重建 —— 无界时条目会跨会话一直累积。
+     * 用访问序 LRU：常用艺人留在表内，冷门条目被挤出。
+     *
+     * [LinkedHashMap] 非线程安全，所有访问都包在 `synchronized(artistImageCache)` 里；
+     * 不持有该锁跨越挂起点（网络请求与 `withLock` 都在锁外）。
+     */
+    private val artistImageCache =
+        object : LinkedHashMap<String, String>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>): Boolean = size > MAX_ARTIST_IMAGE_ENTRIES
+        }
+
+    /**
+     * 艺术家 id → 该 id 的查询锁，保证同一 id 只发一次请求。
+     *
+     * 仅在请求进行期间存在：请求结束即在 [resolveArtistImage] 的 `finally` 中移除，
+     * 因此表的大小受「并发中的艺人数量」约束，不随历史累计。
+     */
     private val artistImageLocks = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
 
     /** 简单嗅探：非图片响应（错误页、占位图）不要写进文件。 */

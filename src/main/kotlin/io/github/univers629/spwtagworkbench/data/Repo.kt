@@ -753,6 +753,11 @@ object Repo {
 
     fun shutdown() {
         Epoch.invalidateAll()
+        // 检索缓存随插件停用清空；命中次数写日志便于确认复用效果
+        Diag.log("cache: 命中 ${aggregator.searchCacheHits()} 次，条目 ${aggregator.searchCacheSize()} 条，停用清空")
+        aggregator.invalidateSearchCache()
+        // 封面缓存持有图片原始字节（单图 + 多图两条），停用后不应继续驻留内存
+        CoverStore.clearPictures()
         status = null
         spectrum = SpectrumState.Idle
         // **生命周期闭环**：取消两个作用域与轮询，否则禁用插件后
@@ -1992,6 +1997,72 @@ object Repo {
     }
 
     /**
+     * QQ 回放增益：本地标签没有、源侧已经给出时**暂存进草稿**。
+     *
+     * 只暂存、不落盘：进页浏览或检索不该直接改文件，与本地测量的
+     * [measureReplayGain]（"只测不写"）以及封面/元数据的草稿策略保持一致。
+     * 写入由用户点「保存」触发，与其它草稿同一条路径。
+     *
+     * 只用**已经发生的检索**结果（从聚合器的检索缓存里读），不为它单独发请求；
+     * 只有用户触发了封面 / 歌词 / 艺术家 / 批量匹配检索时才会命中。
+     * 只暂存音轨增益与峰值：QQ 的 `volume.lra` 没有对应的标签键，只记日志。
+     *
+     * 候选选取沿用与批量匹配相同的判据（见 `matchAndWriteOne` 的注释）：
+     * `CandidateScoring.level` **1 最可信**，因此用 `minWithOrNull` 而不是取最大值；
+     * 且必须先剔除 `level == 0`（标题/艺术家/时长任一不匹配）。
+     * 缓存里存的是该源的**原始**候选，未经 `rank()` 过滤，不能直接取第一条使用。
+     */
+    private fun stageQqGainDraft() {
+        val meta = focused()
+        if (!meta.isPresent || !meta.hasFile) return
+        // 文件里已有 RG，或草稿里已经暂存过，都不覆盖
+        if (replayGainExisting.present) return
+        if (Drafts.draftValue(meta.key, TagField.ReplayGainTrackGain) != null) return
+        val query = SearchQuery(meta.title, meta.artist, meta.album, meta.durationMs)
+        val cached = aggregator.cachedResult("qqmusic", query) ?: return
+        val best =
+            cached.candidates
+                .filter { it.gainDb != null }
+                .filter { CandidateScoring.artistCompatible(meta.artist, it.artist) }
+                // level=0 表示标题/时长都没对上，写进去就是错误数据
+                .filter { CandidateScoring.level(query, it) > 0 }
+                .minWithOrNull(
+                    compareBy<SourceCandidate> { CandidateScoring.level(query, it) }
+                        .thenBy { kotlin.math.abs(it.durationMs - query.durationMs) },
+                )
+                ?: return
+        // 时长差过大时宁可不取：QQ 的 volume 属于整首歌，给错了比没有更糟。
+        // 判据与 CandidateScoring.level 内部一致（两边时长都已知时必须落在容差内）。
+        val durationTooFar =
+            query.durationMs > 0L &&
+                best.durationMs > 0L &&
+                !Matching.durationMatches(query.durationMs, best.durationMs)
+        if (durationTooFar) {
+            Diag.log(
+                "gain: QQ 候选时长差 ${kotlin.math.abs(best.durationMs - query.durationMs)}ms 超出容差，跳过暂存",
+            )
+            return
+        }
+        val gain = best.gainDb ?: return
+        val key = meta.key
+        val gainText = ReplayGainScanner.formatGain(gain.toDouble())
+        val peakText = best.gainPeak?.let { ReplayGainScanner.formatPeak(it.toDouble()) }.orEmpty()
+        postOnMain {
+            // 期间可能已切歌：只对仍是当前曲目的写入草稿
+            if (focused().key != key) return@postOnMain
+            Drafts.stageField(key, TagField.ReplayGainTrackGain, gainText)
+            if (peakText.isNotBlank()) {
+                Drafts.stageField(key, TagField.ReplayGainTrackPeak, peakText)
+            }
+            Diag.log(
+                "gain: 已用 QQ 回放增益暂存草稿 ${best.title} " +
+                    "gain=$gainText peak=$peakText lra=${best.gainRange ?: "-"}",
+            )
+            postStatus(Status(L10n.t("status2.gainFromQq", gainText), Status.Kind.Warn))
+        }
+    }
+
+    /**
      * 测量当前曲目。
      *
      * **只测不写**：结果落在 [replayGainMeasured]，界面展示后再由
@@ -2128,24 +2199,48 @@ object Repo {
     var artistLoading by mutableStateOf(false)
         private set
 
+    /** 最近一次发起艺术家图检索的曲目，用于防重复触发。 */
+    private var lastArtistKey = ""
+
     /**     * 流式装载艺术家图候选。     *     * 与 [loadNetworkCovers] 是**两套逻辑**：这里走 [MusicSource.artistCover]，     * 端点完全不同（QQ `T001`、酷狗 `softhead`、网易云 `img1v1Url`）。     */
     fun loadNetworkArtistCovers() {
         val meta = focused()
         if (!meta.isPresent) return
+        // 防重复：同一首歌正在加载中就不再发起，避免页面重新进入组合时整套源跑两遍
+        if (artistLoading && lastArtistKey == meta.key) {
+            Diag.log("artistCovers: 已在加载中，跳过重复触发 key=${meta.key.take(12)}")
+            return
+        }
+        lastArtistKey = meta.key
         val token = Epoch.nextOnline()
+        // 主检索与封面页 / 歌词页 / 批量匹配共用同一关键词（专辑+艺人），
+        // 命中聚合器的检索缓存，同一首歌只真正请求源一次。
         val query = SearchQuery(meta.title, meta.artist, meta.album, meta.durationMs)
+        // 回退检索：主检索拿不到艺人图时，改用纯艺人名再搜一次
+        val artistQuery =
+            SearchQuery(
+                title = meta.title,
+                artist = meta.artist,
+                album = meta.album,
+                durationMs = meta.durationMs,
+                keywordOverride = meta.artist.ifBlank { meta.title },
+            )
         val usable = aggregator.artistSources()
         // 流式模式：每源一个「搜索中」占位，返回即替换（与封面页一致）
         networkArtistCovers = usable.map { source -> CoverTile.Searching(source.id, source.label, 1) }
         artistLoading = true
+        // 跨源同图去重：同一艺人的图会被多个源返回，只保留先到的那张
+        val seenArtistImages = java.util.concurrent.ConcurrentHashMap
+            .newKeySet<String>()
         scope.launch {
             kotlinx.coroutines.coroutineScope {
                 usable.forEach { source ->
                     launch(Dispatchers.IO) {
-                        val group =
+                        var group =
                             runCatching {
                                 aggregator.groupFor(source, query, Aggregator.GroupRank.ARTIST)
                             }.getOrNull()
+
                         // 艺术家图的判据是**艺术家**，不是标题。
                         //
                         // 艺术家图归属于艺人：同一艺人的任何一首歌，其艺人图都是同一张。
@@ -2156,8 +2251,8 @@ object Repo {
                         // 也**不再要求 artistArtworkUrl 非空**：网易云的搜索响应不含
                         // 艺人图字段，要等 artistCover() 打艺术家端点才能确定有无。
                         // 取不到时那次下载会返回 null，由 filterNotNull 丢在下载环节。
-                        val pool =
-                            group
+                        fun poolOf(g: io.github.univers629.spwtagworkbench.backend.source.SourceGroup?) =
+                            g
                                 ?.items
                                 ?.filter {
                                     CandidateScoring.artistCompatible(query.artist, it.candidate.artist)
@@ -2173,10 +2268,30 @@ object Repo {
                                         }
                                     }
                                 }.orEmpty()
+                        var pool = poolOf(group)
+                        if (pool.isEmpty()) {
+                            // 专辑关键词没给出艺人图时，回退到纯艺人名检索
+                            val retried =
+                                runCatching {
+                                    aggregator.groupFor(source, artistQuery, Aggregator.GroupRank.ARTIST)
+                                }.getOrNull()
+                            if (retried != null && retried.items.isNotEmpty()) {
+                                Diag.log("artistCovers: ${source.label} 主检索无结果，回退艺人名检索")
+                                group = retried
+                                pool = poolOf(retried)
+                            }
+                        }
                         Diag.log(
                             "artistCovers: ${source.label} 搜索结果=" + (group?.items?.size ?: 0) +
                                 " 可下载=" + pool.size,
                         )
+                        val artistFiltered = (group?.items?.size ?: 0) - pool.size
+                        if (artistFiltered > 0) {
+                            Diag.log(
+                                "artistCovers: ${source.label} 过滤掉=" + artistFiltered +
+                                    "（艺人名不匹配或重复艺人）",
+                            )
+                        }
                         // 并行下载
                         val downloaded =
                             pool
@@ -2215,7 +2330,19 @@ object Repo {
                                         )
                                     }
                                 }.awaitAll()
-                        val picks = downloaded.filterNotNull()
+                        val picks =
+                            downloaded
+                                .filterNotNull()
+                                .filter { candidate ->
+                                    val bytes = candidate.bytes ?: return@filter true
+                                    seenArtistImages.add("${bytes.size}:${bytes.contentHashCode()}")
+                                }
+                        if (picks.size < downloaded.size) {
+                            Diag.log(
+                                "artistCovers: ${source.label} 下载失败或重复=" +
+                                    (downloaded.size - picks.size) + "/" + downloaded.size,
+                            )
+                        }
                         // 流式上屏：这个源一返回就立刻补进去，不等其它源
                         withContext(Dispatchers.Main) {
                             if (!Epoch.onlineAlive(token)) return@withContext
@@ -2240,6 +2367,7 @@ object Repo {
                 if (ready.isEmpty()) {
                     postStatus(Status(L10n.t("status.noArtistResults"), Status.Kind.Warn))
                 }
+                stageQqGainDraft()
             }
         }
     }
@@ -2383,6 +2511,41 @@ object Repo {
                             if (result.candidates.isEmpty()) Status.Kind.Warn else Status.Kind.Ok,
                     ),
                 )
+                // 检索已经发生：QQ 给了回放增益就暂存进草稿（本地没有时）
+                stageQqGainDraft()
+            }
+        }
+    }
+
+    /** 信息页数据变化信号：写操作完成后自增，页面据此重读文件。 */
+    var infoRefreshTick by mutableStateOf(0)
+        private set
+
+    /**
+     * 删除当前曲目的第 [index] 张内嵌图片。
+     *
+     * 信息页只读，唯一的写操作就是这里：用于清理类型非法或多余的图片。
+     */
+    fun removePicture(
+        index: Int,
+        expectedType: Int = -1,
+        expectedSize: Int = -1,
+    ) {
+        val meta = focused()
+        if (!meta.isPresent || !meta.hasFile) {
+            postStatus(Status(L10n.t("status.noTrackSelected"), Status.Kind.Error))
+            return
+        }
+        val key = meta.key
+        scope.launch(Dispatchers.IO) {
+            val result = Tags.removePicture(meta.path, index, expectedType, expectedSize)
+            withContext(Dispatchers.Main) {
+                postStatus(Status(result.message, if (result.ok) Status.Kind.Ok else Status.Kind.Error))
+                if (result.ok && focused().key == key) {
+                    loadCovers(meta)
+                }
+                // 成败都通知信息页重读：失败时页面要恢复删除按钮，成功时要拿到新列表
+                infoRefreshTick++
             }
         }
     }
@@ -2503,6 +2666,9 @@ object Repo {
         Diag.log(
             "covers: 开始检索 key=${meta.key.take(12)} 源=" + usable.joinToString(",") { it.label },
         )
+        // 跨源同图去重：不同源对同一张专辑往往给同一张图，只保留先到的那张
+        val seenImages = java.util.concurrent.ConcurrentHashMap
+            .newKeySet<String>()
         scope.launch {
             kotlinx.coroutines.coroutineScope {
                 usable.forEach { source ->
@@ -2530,27 +2696,53 @@ object Repo {
                         // 标题与专辑名均无法匹配，字符串比较结果全为 0。
                         // 检索已按专辑发出，改为接受「源解析出的那张专辑」的候选。
                         val items = group?.items.orEmpty()
-                        val albumTarget =
-                            if (query.album.isNotBlank()) {
-                                CandidateScoring.dominantAlbum(items.map { it.candidate })
-                            } else {
-                                null
-                            }
+                        // 用 groupFor **排序时**算出的那张专辑，不在这里重算：
+                        // 重算的输入是截断后的 items（每源只剩 5 条），众数可能与
+                        // 排序时（全部候选）不同，于是把排序特意排前面的候选过滤掉。
+                        val albumTarget = group?.albumTarget
                         val pool =
-                            items.filter {
-                                if (albumTarget != null) {
-                                    it.candidate.album == albumTarget
-                                } else {
-                                    coverRelevant(query, it.candidate)
+                            items
+                                .filter {
+                                    if (albumTarget != null) {
+                                        it.candidate.album == albumTarget
+                                    } else {
+                                        coverRelevant(query, it.candidate)
+                                    }
                                 }
+                                // 同一张专辑的每首曲目共用封面，源会把它们各返回一条，
+                                // 5 条结果是同一张图；按封面地址先去重，避免重复下载。
+                                .distinctBy { it.candidate.artworkUrl.ifBlank { it.candidate.remoteId } }
+                        // 兜底：按专辑过滤后一条不剩时（源返回的专辑名与排序时算出的
+                        // 众数不一致，多半是截断把众数候选切掉了），退回标题相关性判定，
+                        // 至少不把这一源整个丢了。
+                        val effective =
+                            if (pool.isEmpty() && items.isNotEmpty()) {
+                                val fallback =
+                                    items
+                                        .filter { coverRelevant(query, it.candidate) }
+                                        .distinctBy { it.candidate.artworkUrl.ifBlank { it.candidate.remoteId } }
+                                if (fallback.isNotEmpty()) {
+                                    Diag.log(
+                                        "covers: ${source.label} 专辑过滤后为空，退回标题判定得到 ${fallback.size} 条",
+                                    )
+                                }
+                                fallback
+                            } else {
+                                pool
                             }
                         Diag.log(
                             "covers: ${source.label} 搜索结果=" + (group?.items?.size ?: 0) +
-                                " 可下载=" + pool.size,
+                                " 可下载=" + effective.size,
                         )
+                        if (items.isNotEmpty() && effective.size < items.size) {
+                            Diag.log(
+                                "covers: ${source.label} 过滤掉=" + (items.size - effective.size) +
+                                    if (albumTarget != null) "（专辑不匹配）" else "（标题不匹配）",
+                            )
+                        }
                         // 并行下载：谁先回谁先用，并发由 NetGate 统一收口。
                         val downloaded =
-                            pool
+                            effective
                                 .take(PER_SOURCE_PICKS)
                                 .map { item ->
                                     async(Dispatchers.IO) {
@@ -2558,17 +2750,33 @@ object Repo {
                                             try {
                                                 source.cover(item.candidate)
                                             } catch (t: Throwable) {
+                                                // 记录失败原因：否则「该源一条都没有」无法区分
+                                                // 是接口挂了、图太大还是解码失败
+                                                Diag.log(
+                                                    "covers: ${source.label} 封面下载异常 " +
+                                                        "${t.javaClass.simpleName}: ${t.message.orEmpty().take(60)}",
+                                                )
                                                 null
-                                            } ?: return@async null
+                                            }
+                                        if (bytes == null) {
+                                            Diag.log("covers: ${source.label} 封面下载返回空（无图或 HTTP 失败）")
+                                            return@async null
+                                        }
                                         // 尺寸过滤用**原始终身**（imageSize 只读头部不解码），
                                         // 降采样后的位图尺寸变小，不能拿来做最低分辨率判断
                                         val (origW, origH) = Host.imageSize(bytes)
-                                        if (origW <= 0 || origH <= 0) return@async null
+                                        if (origW <= 0 || origH <= 0) {
+                                            Diag.log(
+                                                "covers: ${source.label} 尺寸读取失败，跳过" +
+                                                    "（${bytes.size} 字节）",
+                                            )
+                                            return@async null
+                                        }
                                         val shortSide = minOf(origW, origH)
                                         if (shortSide < CoverCandidate.MIN_SHORT_SIDE) {
                                             Diag.log(
                                                 "covers: 跳过低清 ${source.label} " +
-                                                    "${origW}x$origH",
+                                                    "${origW}x$origH（低于 ${CoverCandidate.MIN_SHORT_SIDE}）",
                                             )
                                             return@async null
                                         }
@@ -2588,7 +2796,19 @@ object Repo {
                                         )
                                     }
                                 }.awaitAll()
-                        val picks = downloaded.filterNotNull()
+                        val picks =
+                            downloaded
+                                .filterNotNull()
+                                .filter { candidate ->
+                                    val bytes = candidate.bytes ?: return@filter true
+                                    seenImages.add("${bytes.size}:${bytes.contentHashCode()}")
+                                }
+                        if (picks.size < downloaded.size) {
+                            Diag.log(
+                                "covers: ${source.label} 下载失败或重复=" +
+                                    (downloaded.size - picks.size) + "/" + downloaded.size,
+                            )
+                        }
                         // 流式上屏：这个源一返回就立刻补进去，不等其它源。
                         // MusicTag 就是这么做的——先出的先看，首图时间取决于最快的源。
                         withContext(Dispatchers.Main) {
@@ -2632,6 +2852,7 @@ object Repo {
                             if (ready.isEmpty()) Status.Kind.Warn else Status.Kind.Ok,
                     ),
                 )
+                stageQqGainDraft()
             }
         }
     }

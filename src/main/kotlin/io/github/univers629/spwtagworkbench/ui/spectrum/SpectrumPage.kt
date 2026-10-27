@@ -36,6 +36,7 @@ import io.github.univers629.spwtagworkbench.core.T
 import io.github.univers629.spwtagworkbench.core.TapChip
 import io.github.univers629.spwtagworkbench.core.Txt
 import io.github.univers629.spwtagworkbench.core.i18n.L10n
+import io.github.univers629.spwtagworkbench.data.Drafts
 import io.github.univers629.spwtagworkbench.data.Repo
 import io.github.univers629.spwtagworkbench.data.SpectrogramState
 import io.github.univers629.spwtagworkbench.router.SpacePage
@@ -367,19 +368,23 @@ private fun Skeleton() {
  * 447ms，串行要 763ms）；增益那点耗时完全藏在频谱渲染里，进页总耗时不增加。
  *
  * 三种显示状态：
+ * - 草稿里已暂存 → 显示草稿值并标「未保存」（源侧增益或本地测量都会先进草稿）
  * - 文件里已有增益 → 直接显示（播放器「音量平衡」实际会用的值）
  * - 没有 → 进页时自动测量，显示测量结果，**不写盘**
  * - 测量中 → 显示进度
  *
- * 写入必须点「写入」—— 进页就改文件太意外。
+ * 写入一律经「保存」：进页浏览就改文件不符合预期。
  */
 @Composable
 private fun ReplayGainRow(interactive: Boolean) {
     val pal = Salt
+    val focused = Repo.focused()
     val existing = Repo.replayGainExisting
     val measured = Repo.replayGainMeasured
     val state = Repo.replayGainState
-    val hasFile = Repo.focused().hasFile
+    val hasFile = focused.hasFile
+    // 草稿优先级最高：它是用户还没确认的待写入值
+    val gainDraft = Drafts.replayGainDraft(focused.key)
 
     Row(
         modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
@@ -388,9 +393,15 @@ private fun ReplayGainRow(interactive: Boolean) {
         Txt(L10n.t("spectrum.replayGain"), size = T.caption, color = pal.textTertiary, maxLines = 1)
         Spacer(Modifier.width(10.dp))
 
-        // 值：优先显示文件里已有的（那是真实落盘值），其次显示刚测的
+        // 取值链：草稿 → 文件 → 刚测
         val text =
             when {
+                gainDraft != null -> {
+                    val (gain, peak) = gainDraft
+                    val peakSuffix = if (peak.isNotBlank()) L10n.t("spectrum.peakSuffix", peak) else ""
+                    L10n.t("spectrum.draft", gain, peakSuffix)
+                }
+
                 existing.present -> {
                     val peak = if (existing.trackPeak.isNotBlank()) L10n.t("spectrum.peakSuffix", existing.trackPeak) else ""
                     L10n.t("spectrum.existing", existing.trackGain, peak)
@@ -406,6 +417,8 @@ private fun ReplayGainRow(interactive: Boolean) {
             }
         val tone =
             when {
+                // 草稿只是「待写入」，用 warn 与已落盘的 ok 区分开
+                gainDraft != null -> pal.warn
                 existing.present -> pal.ok
                 state is Repo.GainState.Failed -> pal.error
                 measured != null && measured.ok -> pal.warn
@@ -414,19 +427,29 @@ private fun ReplayGainRow(interactive: Boolean) {
         Txt(text, size = T.label, color = tone, maxLines = 1)
         Spacer(Modifier.weight(1f))
 
-        if (measured != null && measured.ok && !existing.present) {
+        // 有「未落盘」的测量结果时给写入入口：只测不写，由这里显式落盘
+        if (measured != null && measured.ok && !existing.present && gainDraft == null) {
             TapChip(
                 label = L10n.t("spectrum.write"),
                 onClick = { Repo.applyMeasuredReplayGain() },
                 enabled = interactive && hasFile,
             )
         }
-        if (existing.present) {
-            TapChip(
-                label = L10n.t("spectrum.clear"),
-                onClick = { Repo.clearReplayGainTag() },
-                enabled = interactive && hasFile,
-            )
+        // 已有草稿或已落盘时给「放弃」入口；落盘的那种走 clearReplayGainTag
+        when {
+            gainDraft != null ->
+                TapChip(
+                    label = L10n.t("spectrum.discardDraft"),
+                    onClick = { Repo.discardCurrentDraft() },
+                    enabled = interactive && hasFile,
+                )
+
+            existing.present ->
+                TapChip(
+                    label = L10n.t("spectrum.clear"),
+                    onClick = { Repo.clearReplayGainTag() },
+                    enabled = interactive && hasFile,
+                )
         }
     }
 }

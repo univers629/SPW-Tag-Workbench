@@ -12,6 +12,13 @@
           "on_click": "io.github.univers629.spwtagworkbench.MainPlugin.openWorkbench"
         },
         {
+          "type": "button",
+          "title": "快捷键设置",
+          "summary": "在宿主的「设置 → 快捷键」中修改「打开音乐标签工作台」的键位，默认 Ctrl+Alt+T",
+          "arrow_type": "none",
+          "on_click": "io.github.univers629.spwtagworkbench.MainPlugin.showShortcutHint"
+        },
+        {
           "type": "list",
           "key": "matching.policy",
           "title": "批量匹配时的已有标签策略",
@@ -46,14 +53,51 @@
           "key": "sidebar.rail",
           "title": "显示侧栏悬浮按钮",
           "summary": "窗口右侧的全局侧边栏召唤按钮",
-          "default": true
+          "default_value": true
+        },
+        {
+          "type": "switch",
+          "key": "titlebar.entry",
+          "title": "在顶部标题栏显示召唤按钮",
+          "summary": "标题栏多一枚插件按钮，单击即执行下面的默认行为",
+          "default_value": true
+        },
+        {
+          "type": "list",
+          "key": "titlebar.action",
+          "title": "顶部按钮点击时的默认行为",
+          "summary": "单击按钮直接执行所选项，不弹出菜单",
+          "entries": [
+            "打开工作台",
+            "开合全局侧边栏"
+          ],
+          "entry_values": [
+            "workbench",
+            "sidebar"
+          ],
+          "default_value": "workbench"
+        },
+        {
+          "type": "list",
+          "key": "titlebar.position",
+          "title": "顶部召唤按钮的位置",
+          "summary": "排在宿主「快捷」按钮的左侧或右侧；宿主标题栏是固定一排，插件只能选择锚定哪个位置",
+          "entries": [
+            "快捷按钮左侧",
+            "快捷按钮右侧"
+          ],
+          "entry_values": [
+            "left",
+            "right"
+          ],
+          "default_value": "left"
         },
         {
           "type": "switch",
           "key": "view.showArtistSlots",
           "title": "工作台主视图显示艺术家封面",
           "summary": "关闭后主封面下方不再显示艺术家封面槽位",
-          "default": true
+          "default_value": true
         },
         {
           "type": "button",

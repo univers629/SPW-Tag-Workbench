@@ -83,14 +83,8 @@ fun WorkbenchPage() {
                 .background(Salt.pageOverlay),
     ) {
         DeskDetail(Modifier.fillMaxSize())
-        // 专辑批量确认弹窗由 SpaceCanvas 根级统一渲染：
-        // 桌面始终在树里，而专题页盖在它之上，弹窗留在这里会被专题页挡住。
-        StatusBar(
-            modifier =
-                Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 14.dp),
-        )
+        // 专辑批量确认弹窗与状态提示都由 SpaceCanvas 根级统一渲染：
+        // 桌面始终在树里，而专题页盖在它之上，留在这里会被专题页挡住。
     }
 }
 
@@ -738,43 +732,6 @@ private fun RegionHeader(
     }
 }
 
-// ── 可见终态条 ───────────────────────────────────────────────────────────────
-
-@Composable
-private fun StatusBar(modifier: Modifier = Modifier) {
-    val pal = Salt
-    val status = Repo.status ?: return
-    val color =
-        when (status.kind) {
-            io.github.univers629.spwtagworkbench.data.Status.Kind.Ok -> pal.ok
-            io.github.univers629.spwtagworkbench.data.Status.Kind.Warn -> pal.warn
-            io.github.univers629.spwtagworkbench.data.Status.Kind.Error -> pal.error
-            io.github.univers629.spwtagworkbench.data.Status.Kind.Busy -> pal.accent
-        }
-    Card(
-        modifier = modifier.clickable { Repo.clearStatus() },
-        color = pal.cardOverlay,
-        radius = 10.dp,
-        outline = color.copy(alpha = 0.5f),
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(
-                modifier =
-                    Modifier
-                        .size(6.dp)
-                        .clip(RoundedCornerShape(3.dp))
-                        .background(color),
-            )
-            Spacer(Modifier.width(9.dp))
-            Txt(status.text, size = T.caption, color = pal.text, maxLines = 1)
-        }
-    }
-}
-
-// 小工具：把包络画进任意容器
 private fun Modifier.drawEnvelope(
     samples: FloatArray?,
     color: Color,

@@ -80,17 +80,47 @@ private class Parser(
 ) {
     private var index = 0
 
+    /**
+     * 当前嵌套深度。
+     *
+     * 解析器是递归下降：[parseObject] / [parseArray] 互相递归，
+     * 一条形如 `[[[[…]]]]` 的响应会让栈随深度线性增长，最终抛
+     * `StackOverflowError`。该错误属 `Throwable`，虽然会被调用方的
+     * catch 接住，但**栈已耗尽、恢复不可靠**，所以要在到达之前主动拒绝。
+     *
+     * 音源响应的真实嵌套通常不超过 8 层，[MAX_DEPTH] 留了足够余量。
+     */
+    private var depth = 0
+
     fun parseValue(): Json {
         skipWhitespace()
         if (index >= text.length) throw Json.JsonException("空文档")
         return when (val c = text[index]) {
-            '{' -> parseObject()
-            '[' -> parseArray()
+            '{' -> enterDepth { parseObject() }
+            '[' -> enterDepth { parseArray() }
             '"' -> Json.Str(parseString())
             't' -> parseLiteral("true", Json.Bool(true))
             'f' -> parseLiteral("false", Json.Bool(false))
             'n' -> parseLiteral("null", Json.Null)
             else -> if (c == '-' || c.isDigit()) parseNumber() else throw Json.JsonException("意外字符 '$c' @ $index")
+        }
+    }
+
+    private companion object {
+        /** 允许的最大嵌套层数：音源响应实际不超过 8 层，64 留足余量。 */
+        const val MAX_DEPTH = 64
+    }
+
+    /** 进入一层嵌套，超过 [MAX_DEPTH] 立即拒绝；退出时无论成败都还原深度。 */
+    private fun <T> enterDepth(block: () -> T): T {
+        if (++depth > MAX_DEPTH) {
+            depth--
+            throw Json.JsonException("嵌套超过 $MAX_DEPTH 层 @ $index")
+        }
+        return try {
+            block()
+        } finally {
+            depth--
         }
     }
 

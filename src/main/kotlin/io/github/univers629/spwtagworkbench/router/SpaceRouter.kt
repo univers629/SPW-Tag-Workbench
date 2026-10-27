@@ -23,6 +23,7 @@ enum class SpacePage(
     Artist("艺术家", "region-artist"),
     Spectrum("频谱", "region-spectrum"),
     Timeline("打轴", "region-timeline"),
+    Info("信息", "region-info"),
     ;
 
     val isDetail: Boolean get() = this != Desk

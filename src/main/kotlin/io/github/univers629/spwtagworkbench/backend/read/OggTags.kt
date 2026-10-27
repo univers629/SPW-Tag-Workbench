@@ -4,6 +4,7 @@
 package io.github.univers629.spwtagworkbench.backend.read
 
 import java.io.File
+import java.io.RandomAccessFile
 
 /**
  * Ogg / Opus 注释读写。
@@ -57,16 +58,74 @@ object OggTags {
         val endsWithPacketBoundary: Boolean get() = lacing.isNotEmpty() && lacing.last() < 255
     }
 
+    /**
+     * 读标签时最多扫多少字节。
+     *
+     * 注释包必然在文件开头几页，但它自身可能很大（封面以 Base64 塞进
+     * `METADATA_BLOCK_PICTURE`，几十 KB 到几 MB 都见过），所以上限取 8 MiB。
+     * 关键是**不能**像写路径那样整份读：一首 100 MB 的 Opus 只为读标题就
+     * 要读 100 MB，而曲目扫描对每个文件都会调到这里。
+     */
+    private const val MAX_READ_BYTES = 8L * 1024 * 1024
+
     /** 读取注释；不是 Ogg/Opus 或没有注释时返回 null。 */
     fun read(file: File): Comment? =
         try {
-            val bytes = file.readBytes()
-            val pages = parsePages(bytes) ?: return null
-            val packet = assemblePackets(bytes, pages).firstOrNull { startsWithAscii(it, "OpusTags") } ?: return null
-            parseComment(packet)
+            RandomAccessFile(file, "r").use { raf -> readNote(raf) }
         } catch (_: Throwable) {
             null
         }
+
+    /**
+     * 只扫开头若干页找 `OpusTags` 包。
+     *
+     * 按段表（lacing）重组逻辑包：段值 255 表示包未结束、要到后续页继续拼，
+     * 小于 255 才是包的结尾 —— 因此跨页的注释包（封面较大时很常见）也能拼完整。
+     *
+     * 写完就走：[write] 仍然整份读入，因为它要重排页并重算 CRC；读标签不需要。
+     */
+    private fun readNote(raf: RandomAccessFile): Comment? {
+        val length = raf.length()
+        var pos = 0L
+        var consumed = 0L
+        var pending = java.io.ByteArrayOutputStream()
+        while (pos + 27 <= length && consumed < MAX_READ_BYTES) {
+            raf.seek(pos)
+            val header = ByteArray(27)
+            raf.readFully(header)
+            if (header[0] != 'O'.code.toByte() ||
+                header[1] != 'g'.code.toByte() ||
+                header[2] != 'g'.code.toByte() ||
+                header[3] != 'S'.code.toByte()
+            ) {
+                return null
+            }
+            val segments = header[26].toInt() and 0xFF
+            if (pos + 27 + segments > length) return null
+            val lacing = ByteArray(segments)
+            raf.readFully(lacing)
+            var payloadLen = 0
+            for (seg in lacing) payloadLen += seg.toInt() and 0xFF
+            val pageSize = 27L + segments + payloadLen
+            if (pos + pageSize > length) return null
+            val payload = ByteArray(payloadLen)
+            if (payloadLen > 0) raf.readFully(payload)
+            var offset = 0
+            for (seg in lacing) {
+                val lengthInPage = seg.toInt() and 0xFF
+                pending.write(payload, offset, lengthInPage)
+                offset += lengthInPage
+                if (lengthInPage < 255) {
+                    val packet = pending.toByteArray()
+                    pending = java.io.ByteArrayOutputStream()
+                    if (startsWithAscii(packet, "OpusTags")) return parseComment(packet)
+                }
+            }
+            consumed += pageSize
+            pos += pageSize
+        }
+        return null
+    }
 
     /** 读取全部图片（`METADATA_BLOCK_PICTURE`，按类型去重）。 */
     fun pictures(file: File): List<Picture> {
@@ -220,27 +279,6 @@ object OggTags {
             p += 27 + segmentCount + payloadLen
         }
         return if (pages.isEmpty()) null else pages
-    }
-
-    /** 按流组装逻辑包（只处理单流文件）。 */
-    private fun assemblePackets(
-        bytes: ByteArray,
-        pages: List<Page>,
-    ): List<ByteArray> {
-        val packets = mutableListOf<ByteArray>()
-        var pending = java.io.ByteArrayOutputStream()
-        for (page in pages) {
-            var offset = page.payloadStart
-            for (seg in page.lacing) {
-                pending.write(bytes, offset, seg)
-                offset += seg
-                if (seg < 255) {
-                    packets += pending.toByteArray()
-                    pending = java.io.ByteArrayOutputStream()
-                }
-            }
-        }
-        return packets
     }
 
     /** 返回（注释包起始页索引，跨越页数）。 */

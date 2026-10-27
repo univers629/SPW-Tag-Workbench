@@ -95,6 +95,36 @@ fun IconTimeline(
     }
 }
 
+/** 信息：圆环 + 中间一个小写 i（详情页通用图标）。 */
+@Composable
+fun IconInfo(
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    Canvas(modifier) {
+        val s = minOf(size.width, size.height)
+        drawCircle(
+            color = color,
+            radius = s * 0.36f,
+            center = center,
+            style = Stroke(width = s * STROKE),
+        )
+        // 小写 i：上方圆点 + 下方竖线
+        drawCircle(
+            color = color,
+            radius = s * 0.035f,
+            center = Offset(s * 0.5f, s * 0.30f),
+        )
+        drawLine(
+            color = color,
+            start = Offset(s * 0.5f, s * 0.42f),
+            end = Offset(s * 0.5f, s * 0.70f),
+            strokeWidth = s * STROKE,
+            cap = StrokeCap.Round,
+        )
+    }
+}
+
 /** 歌词：描边外框 + 三行无圆点的文字线。 */
 @Composable
 fun IconLyrics(
@@ -419,5 +449,62 @@ fun IconMusicTag(
             cap = StrokeCap.Round,
         )
         drawCircle(color = color, radius = 0.7f * u, center = Offset(10.2f * u, 8.9f * u), style = stroke)
+    }
+}
+
+/**
+ * 召唤按钮图标（**占位**）。
+ *
+ * 顶部标题栏那枚按钮的图标，暂用「工具箱」造型占位，等正式图标定稿后直接替换本函数体即可
+ * （调用方只认函数名与签名）。
+ *
+ * 造型：外框 + 提手 + 中线，落在与其它图标相同的 16 格视图与安全区内，
+ * 线宽统一 `1.1 / 16`，端帽圆头 —— 保证和标题栏其它按钮的视觉重量一致。
+ */
+@Composable
+fun IconSummon(
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    Canvas(modifier) {
+        val s = minOf(size.width, size.height)
+        val u = s / 16f
+        val w = 1.1f * u
+        val stroke = Stroke(width = w, cap = StrokeCap.Round, join = StrokeJoin.Round)
+
+        // 箱体外框：3.0–13.0 × 6.6–13.4，圆角与其它图标一致
+        val body = Path().apply {
+            moveTo(4.0f * u, 6.6f * u)
+            lineTo(12.0f * u, 6.6f * u)
+            quadraticTo(13.0f * u, 6.6f * u, 13.0f * u, 7.6f * u)
+            lineTo(13.0f * u, 12.4f * u)
+            quadraticTo(13.0f * u, 13.4f * u, 12.0f * u, 13.4f * u)
+            lineTo(4.0f * u, 13.4f * u)
+            quadraticTo(3.0f * u, 13.4f * u, 3.0f * u, 12.4f * u)
+            lineTo(3.0f * u, 7.6f * u)
+            quadraticTo(3.0f * u, 6.6f * u, 4.0f * u, 6.6f * u)
+            close()
+        }
+        drawPath(body, color = color, style = stroke)
+
+        // 提手：箱体上沿中央一段弧，两侧各留缺口
+        val handle = Path().apply {
+            moveTo(6.2f * u, 6.6f * u)
+            lineTo(6.2f * u, 5.2f * u)
+            quadraticTo(6.2f * u, 4.2f * u, 7.2f * u, 4.2f * u)
+            lineTo(8.8f * u, 4.2f * u)
+            quadraticTo(9.8f * u, 4.2f * u, 9.8f * u, 5.2f * u)
+            lineTo(9.8f * u, 6.6f * u)
+        }
+        drawPath(handle, color = color, style = stroke)
+
+        // 箱体中线的提纽
+        drawLine(
+            color = color,
+            start = Offset(6.8f * u, 10.0f * u),
+            end = Offset(9.2f * u, 10.0f * u),
+            strokeWidth = w,
+            cap = StrokeCap.Round,
+        )
     }
 }

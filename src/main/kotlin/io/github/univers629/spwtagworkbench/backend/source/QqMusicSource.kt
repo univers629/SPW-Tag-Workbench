@@ -58,8 +58,14 @@ class QqMusicSource : MusicSource {
         // - Desktop 用顶层键 `req_1`，歌曲在 `song.list`
         // - 两种都要看，且**取第一个非空的**（Desktop 响应里可能同时有空的 item_song）
         // - 必须带 `comm`（`ct=19` / `cv=1859`），否则被风控
-        val list = qqSearch(keyword)
+        val outcome = qqSearch(keyword)
+        val list = outcome.songs
         if (list.isEmpty()) {
+            if (outcome.limited) {
+                // 限流走失败分支：聚合器不缓存失败结果，冷却结束后可以重新请求
+                Diag.log("qqmusic: 搜索「$keyword」被限流，跳过")
+                return SourceResult(id, label, failure = "限流")
+            }
             Diag.log("qqmusic: 搜索「$keyword」两种方法与两台主机均返回 0 条")
             return SourceResult(id, label)
         }
@@ -98,6 +104,13 @@ class QqMusicSource : MusicSource {
                     // client_search_cp 上没有 time_public / index_album / index_cd（都是空串），
                     // 但 pubtime 是 Unix 秒级时间戳，能换出年份
                     year = parseYear(song.str("pubtime")),
+                    // 搜索项自带音轨/碟序：index_cd 从 0 开始，写标签要 +1
+                    track = song.num("index_album")?.toInt() ?: 0,
+                    disc = (song.num("index_cd")?.toInt() ?: -1) + 1,
+                    // volume 是 QQ 侧算好的回放增益：gain 为 dB，peak 为线性峰值，lra 为响度范围
+                    gainDb = song.obj("volume")?.num("gain")?.toFloat(),
+                    gainPeak = song.obj("volume")?.num("peak")?.toFloat(),
+                    gainRange = song.obj("volume")?.num("lra")?.toFloat(),
                     albumArtist =
                         if (artist.isNotBlank() && !artist.contains("&") && !artist.contains('/')) {
                             artist
@@ -219,43 +232,69 @@ class QqMusicSource : MusicSource {
     }
 
     /**
-     * QQ 搜索的完整尝试链：Lite 与 Desktop 各试两台主机，返回第一个非空结果。
+     * QQ 搜索尝试链：Mobile 优先，Desktop 两台主机兜底。
      *
-     * 为什么这么绕：QQ 的搜索接口对客户端类型和主机都有风控，单点失败就会**静默返回 0 条**，
-     * 歌词候选里没有 QQ 源，也没有错误提示。
-     * 参考项目 SPW-Tag-Workbench 的做法是逐层回退，这里照搬。
+     * 实测（2026-10）：Lite 方法 29 次全部返回 code 2001（已失效），Desktop 间歇性 2001，
+     * Mobile（u6.y.qq.com）在冷却后稳定可用，因此去掉 Lite、Mobile 提到最前。
+     * 2001 是风控信号：收到后进入冷却，期间直接返回空，避免继续抬高请求密度。
      */
-    private suspend fun qqSearch(keyword: String): List<Json> {
-        // Lite 优先：它的响应更小、风控更松
-        for (desktop in listOf(false, true)) {
-            for (host in QQ_SEARCH_HOSTS) {
-                val body = if (desktop) qqDesktopBody(keyword) else qqLiteBody(keyword)
-                val response =
-                    Http.postJson(
-                        url = "https://$host/cgi-bin/musicu.fcg",
-                        body = body,
-                        headers = searchHeaders + mapOf("Content-Type" to "application/json"),
-                        timeoutMs = 9000,
-                    )
-                if (!response.ok) {
-                    Diag.log("qqmusic: $host ${if (desktop) "Desktop" else "Lite"} 请求失败 ${response.error}")
-                    continue
-                }
-                val parsed =
-                    runCatching { Json.parse(response.body) }.getOrElse {
-                        Diag.log("qqmusic: $host 响应解析失败 ${it.javaClass.simpleName}")
-                        null
-                    } ?: continue
-                val songs = extractQqSongs(parsed)
-                if (songs.isNotEmpty()) {
-                    Diag.log("qqmusic: $host ${if (desktop) "Desktop" else "Lite"} 命中 ${songs.size} 条")
-                    return songs
-                }
-                Diag.log("qqmusic: $host ${if (desktop) "Desktop" else "Lite"} 返回 0 条")
-            }
+    private suspend fun qqSearch(keyword: String): QqSearchOutcome {
+        val now = System.currentTimeMillis()
+        if (now < cooldownUntil) {
+            Diag.log("qqmusic: 冷却中（剩余 ${(cooldownUntil - now) / 1000}s），跳过检索")
+            return QqSearchOutcome(emptyList(), limited = true)
         }
-        return emptyList()
+        for (attempt in QQ_SEARCH_ATTEMPTS) {
+            val body = if (attempt.desktop) qqDesktopBody(keyword) else qqMobileBody(keyword)
+            val response =
+                Http.postJson(
+                    url = "https://${attempt.host}/cgi-bin/musicu.fcg",
+                    body = body,
+                    headers = searchHeaders + mapOf("Content-Type" to "application/json"),
+                    timeoutMs = 9000,
+                )
+            if (!response.ok) {
+                Diag.log("qqmusic: ${attempt.host} ${attempt.label} 请求失败 ${response.error}")
+                continue
+            }
+            val parsed =
+                runCatching { Json.parse(response.body) }.getOrElse {
+                    Diag.log("qqmusic: ${attempt.host} 响应解析失败 ${it.javaClass.simpleName}")
+                    null
+                } ?: continue
+            val songs = extractQqSongs(parsed)
+            if (songs.isNotEmpty()) {
+                Diag.log("qqmusic: ${attempt.host} ${attempt.label} 命中 ${songs.size} 条")
+                return QqSearchOutcome(songs, limited = false)
+            }
+            // 2001 = 风控限流；顶层 code 与分组 code 都可能携带
+            val groupCode = (parsed.obj("req_1") ?: parsed.obj("request"))?.num("code")?.toInt()
+            val topCode = parsed.num("code")?.toInt()
+            if (groupCode == 2001 || topCode == 2001) {
+                cooldownUntil = System.currentTimeMillis() + cooldownMs
+                Diag.log(
+                    "qqmusic: ${attempt.host} ${attempt.label} 被限流（code=2001），" +
+                        "冷却 ${cooldownMs / 1000}s",
+                )
+                return QqSearchOutcome(emptyList(), limited = true)
+            }
+            Diag.log("qqmusic: ${attempt.host} ${attempt.label} 返回 0 条")
+        }
+        return QqSearchOutcome(emptyList(), limited = false)
     }
+
+    /**
+     * 一次检索的结果。
+     *
+     * `limited` 必须随返回值传递，不能存在实例字段里：`search()` 是可并发的
+     * （聚合器只合并「同一源同一关键词」，不同关键词会同时进来），
+     * 共享字段会被后一次调用覆盖，A 的限流就被误报成「成功但 0 条」
+     * 并写进检索缓存。
+     */
+    private data class QqSearchOutcome(
+        val songs: List<Json>,
+        val limited: Boolean,
+    )
 
     /**
      * 从 musicu 响应里取出歌曲数组，兼容两种形状：
@@ -274,18 +313,15 @@ class QqMusicSource : MusicSource {
         return body.obj("song")?.arr("list") ?: emptyList()
     }
 
-    /** Lite 方法：顶层键 `request`，KM 端常用于规避 Desktop 的风控。 */
-    private fun qqLiteBody(keyword: String): String =
+    /** Mobile 方法：`u6.y.qq.com` + `req_1`，歌曲在 `data.body.item_song`。 */
+    private fun qqMobileBody(keyword: String): String =
         buildString {
-            append("""{"comm":{"ct":11,"cv":"0"},"request":{""")
-            append(""""method":"DoSearchForQQMusicLite",""")
+            append("""{"comm":{"ct":"11","v":"1"},"req_1":{""")
+            append(""""method":"DoSearchForQQMusicMobile",""")
             append(""""module":"music.search.SearchCgiService",""")
-            append(""""param":{"search_id":"""")
-            append(System.currentTimeMillis() % 86400000 + 36028797018963968L)
-            append(""","remoteplace":"search.android.keyboard",""")
-            append(""""query":""")
+            append(""""param":{"query":""")
             append(jsonEscape(keyword))
-            append(""","search_type":0,"num_per_page":30,"page_num":1,"highlight":0,"nqc_flag":0,"page_id":1,"grp":1}}}""")
+            append(""","num_per_page":30,"page_num":1,"search_type":0,"grp":1}}}""")
         }
 
     /** Desktop 方法：顶层键 `req_1`，必须带 `comm` 否则被风控。 */
@@ -460,11 +496,31 @@ class QqMusicSource : MusicSource {
         return parsed.str("lyric")?.takeIf { it.isNotBlank() }
     }
 
+    /** 风控冷却截止时间戳：收到 2001 后暂停搜索，避免持续无效请求。 */
+    @Volatile
+    private var cooldownUntil = 0L
+
+    /** 冷却时长：实测停 4~10 秒即恢复，取 20 秒留余量。 */
+    private val cooldownMs = 20_000L
+
     private companion object {
         /** QRC 3DES 密钥（与参考项目 `qq/source.js` 的 QRC_KEY 一致）。 */
         const val QRC_KEY = "!@#)(*$%123ZXC!@!@#)(NHL"
 
-        /** 两台搜索主机：前者主用，后者在风控时兜底。 */
-        val QQ_SEARCH_HOSTS = listOf("u.y.qq.com", "shu6.y.qq.com")
+        /** 搜索尝试顺序：Mobile 优先，Desktop 两台主机兜底。 */
+        val QQ_SEARCH_ATTEMPTS =
+            listOf(
+                SearchAttempt("u6.y.qq.com", desktop = false),
+                SearchAttempt("u.y.qq.com", desktop = true),
+                SearchAttempt("shu6.y.qq.com", desktop = true),
+            )
+    }
+
+    /** 一次搜索尝试：主机 + 客户端方法。 */
+    private data class SearchAttempt(
+        val host: String,
+        val desktop: Boolean,
+    ) {
+        val label: String get() = if (desktop) "Desktop" else "Mobile"
     }
 }

@@ -27,6 +27,13 @@ data class SearchQuery(
     val artist: String = "",
     val album: String = "",
     val durationMs: Long = 0L,
+    /**
+     * 覆盖默认关键词。
+     *
+     * 默认关键词按「专辑 + 艺人」构造，用于检索专辑封面；
+     * 艺术家图只归属艺人，检索时必须只按艺人名，由调用方显式传入。
+     */
+    val keywordOverride: String? = null,
 ) {
     /**
      * 检索关键词。
@@ -36,6 +43,8 @@ data class SearchQuery(
      */
     val keyword: String
         get() {
+            val override = keywordOverride?.trim()
+            if (!override.isNullOrEmpty()) return override
             val builder = StringBuilder()
             if (album.isNotBlank()) {
                 builder.append(album)
@@ -104,6 +113,16 @@ data class SourceCandidate(
      * 只存一个会让另一半接口始终失败，QQ 歌词只能取到逐行。
      */
     val altId: String = "",
+    /**
+     * 源侧提供的回放增益（dB）。
+     *
+     * 目前只有 QQ 给：搜索结果与歌曲详情里都带 `volume.gain`，无需本地测量即可写入标签。
+     */
+    val gainDb: Float? = null,
+    /** 源侧提供的线性峰值（`volume.peak`）。 */
+    val gainPeak: Float? = null,
+    /** 源侧提供的响度范围（`volume.lra`，单位 LU）。 */
+    val gainRange: Float? = null,
 ) {
     val display: String get() = if (artist.isBlank()) title else "$title — $artist"
 }

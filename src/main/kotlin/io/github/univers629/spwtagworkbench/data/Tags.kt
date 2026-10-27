@@ -180,6 +180,17 @@ object Tags {
         return Result(outcome.ok, decorate(outcome.message, ok = outcome.ok, refreshed = outcome.hostRefreshed))
     }
 
+    /** 删除指定序号的内嵌图片；信息页用来清理非法图片。 */
+    fun removePicture(
+        path: String,
+        index: Int,
+        expectedType: Int = -1,
+        expectedSize: Int = -1,
+    ): Result {
+        val outcome = AudioTagWriter.removePicture(path, index, expectedType, expectedSize)
+        return Result(outcome.ok, decorate(outcome.message, ok = outcome.ok, refreshed = outcome.hostRefreshed))
+    }
+
     /** 清除四个 ReplayGain 键（写空值即删除）。 */
     fun clearReplayGain(path: String): Result {
         val track = ensureTrack(path) ?: return Result(false, L10n.t("err.fileUnreadable"))
