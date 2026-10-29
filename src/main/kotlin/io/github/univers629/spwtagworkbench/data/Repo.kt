@@ -1952,7 +1952,7 @@ object Repo {
      *
      * 两个理由：
      * - 已有值就是播放器实际会用的值，直接显示比重新测一遍更有意义
-     * - 每次进页都重测的话，翻二十首就白烧十秒 CPU
+     * - 每次进页都重测的话，翻二十首就消耗十秒 CPU
      *
      * **只测不写**：写入必须由 [applyMeasuredReplayGain] 显式触发。
      */
@@ -3537,7 +3537,7 @@ object Repo {
                 }
                 val backend = Track(id = meta.id, path = meta.path)
                 // 只有当真有封面草稿时才读回字节：没有就传 null，
-                // 免得白白把原封面读进内存又原样写回去。
+                // 免得把原封面读进内存又原样写回去。
                 val coverArt =
                     draft.cover?.readBytes()?.let {
                         io.github.univers629.spwtagworkbench.backend.read.CoverMime

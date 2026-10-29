@@ -374,9 +374,14 @@ object HostBridge {
      * 只读探测：宿主曲库里这条 id 是否存在，用于区分「id 不对」与「播放链路不对」。
      *
      * 读 `PlaybackController.playbackQueueState` 当前队列里的曲目 id 集合。
+     * id getter 是**混淆名**，按宿主版本从 [HostPointResolver] 取，
+     * 取不到就返回空列表（不猜名字）。
      */
     fun hostQueueIds(): List<String> =
         try {
+            val getter =
+                HostPointResolver.resolveMediaItemIdGetter()
+                    ?: return emptyList()
             val loader = HostBridge::class.java.classLoader
             val pc = Class.forName(PLAYBACK_CONTROLLER, false, loader).getField("INSTANCE").get(null)
             val state = pc.javaClass.getMethod("getPlaybackQueueState").invoke(pc)
@@ -384,7 +389,7 @@ object HostBridge {
             val items = value?.javaClass?.getMethod("getMediaItems")?.invoke(value) as? List<*>
             items
                 ?.mapNotNull { mi ->
-                    runCatching { mi?.javaClass?.getMethod("\u037f")?.invoke(mi) as? String }.getOrNull()
+                    runCatching { mi?.javaClass?.getMethod(getter)?.invoke(mi) as? String }.getOrNull()
                 }.orEmpty()
         } catch (t: Throwable) {
             Diag.log("queue-ids: 读取失败 ${t.javaClass.simpleName}")

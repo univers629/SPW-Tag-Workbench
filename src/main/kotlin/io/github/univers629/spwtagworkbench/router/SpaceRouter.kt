@@ -268,6 +268,19 @@ object SpaceRouter {
         ShellState.open = true
     }
 
+    /**
+     * 开合宽视图：已展开则收起，未展开则展开。
+     *
+     * 与 [open] 的区别：`open` 在已展开时只处理换页、**不收起**（语义是「不重复打开」），
+     * 因此它不能直接当开关用 —— 快捷键需要的是「开 → 关 → 开」。
+     *
+     * 收起走 [closeShell]，与右上角关闭按钮同一条路径：它只翻转意图，
+     * 由 `Shell` 的组合动画收尾并在结束时 [hardReset] 清页面状态。
+     */
+    fun toggle(target: SpacePage = SpacePage.Desk) {
+        if (ShellState.open) closeShell() else open(target)
+    }
+
     /** 收起宽视图（缩回侧栏锚点）。 */
     fun closeShell() {
         ShellState.open = false

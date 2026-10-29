@@ -18,8 +18,28 @@ object PluginEnv {
     var id: String = ""
         private set
 
-    fun bind(pluginId: String) {
+    /**
+     * 宿主版本串（`PluginContext.spwVersion`，1.19.2 实测为 `1.19.2`）。
+     *
+     * 混淆点位按版本选取，而点位解析发生在宿主无法再提供上下文的场合
+     * （`MainPlugin` 伴生对象里的静态方法），因此在这里留一份。
+     * [bind] 之前为空串，取值方必须容忍不可解析。
+     */
+    var hostVersion: String = ""
+        private set
+
+    /** 宿主渠道（`Steam` / `MS`）；[bind] 之前为空串。 */
+    var hostChannel: String = ""
+        private set
+
+    fun bind(
+        pluginId: String,
+        spwVersion: String = "",
+        spwChannel: String = "",
+    ) {
         id = pluginId
+        hostVersion = spwVersion
+        hostChannel = spwChannel
     }
 
     /**

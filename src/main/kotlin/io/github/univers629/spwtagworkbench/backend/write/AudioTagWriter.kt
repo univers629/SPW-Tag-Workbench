@@ -100,7 +100,7 @@ object AudioTagWriter {
         }
 
         // MP4/M4A 的写前检查：加密文件、容器索引与真实数据对不上的文件都写不进去，
-        // 而且后者的典型表现是底层库抛出 `newPosition > limit`。提前拦下比写坏文件好。
+        // 后者会让底层库抛出 `newPosition > limit`。提前拦下比写坏文件好。
         val mp4 = Mp4Probe.inspect(target)
         if (mp4 != null) return WriteOutcome.failure(path, mp4.message)
         if (coverType == PICTURE_ARTIST && Mp4Probe.isMp4(target)) {

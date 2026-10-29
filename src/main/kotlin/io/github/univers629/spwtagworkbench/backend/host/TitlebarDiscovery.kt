@@ -251,14 +251,35 @@ object TitlebarDiscovery {
         return HostBytecodeIndex(methods)
     }
 
+    /**
+     * 除了 Compose 之外，还需要索引的包。
+     *
+     * 粗筛原本只认 `androidx/compose/runtime/Composer`，但插件还依赖一批
+     * **非 Compose 的反射点位**（如 `PiscesMediaItem` 的 id getter）：
+     * 纯数据类不引用 Compose，会被整体跳过，于是这些点位既无法校验、
+     * 也无法在改版后重新发现。
+     *
+     * 按包前缀白名单放行，而不是取消粗筛：宿主有 4 万多个 class，
+     * 全量解析会明显拖慢扫描（实测索引约 1.1～1.5 秒），
+     * 而下面的包只占几十个类，代价可忽略。
+     */
+    private val EXTRA_INDEXED_PACKAGES =
+        listOf(
+            // PiscesMediaItem 的 id / path getter（混淆名，按版本表取值）
+            "com/xuncorp/pisces/",
+        )
+
     private fun parse(
         bytes: ByteArray,
         into: MutableList<HostMethodBody>,
     ) {
-        // 粗筛：只解析引用了 Compose 运行时的类。
+        // 粗筛：Compose 类，以及上面白名单里的反射点位类。
         // 宿主 jar 有 4 万多个 class，不筛的话扫描会明显变慢。
         val pool = String(bytes, StandardCharsets.ISO_8859_1)
-        if (!pool.contains("androidx/compose/runtime/Composer")) return
+        val wanted =
+            pool.contains("androidx/compose/runtime/Composer") ||
+                EXTRA_INDEXED_PACKAGES.any { pool.contains(it) }
+        if (!wanted) return
 
         val model = ClassFile.of().parse(bytes)
         val owner = model.thisClass().asInternalName()

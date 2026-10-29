@@ -9,6 +9,9 @@ import com.xuncorp.spw.workshop.api.PluginContext
 import com.xuncorp.spw.workshop.api.PluginPermission
 import com.xuncorp.spw.workshop.api.SpwPlugin
 import com.xuncorp.spw.workshop.api.WorkshopApi
+import io.github.univers629.spwtagworkbench.backend.host.HostHookPoints
+import io.github.univers629.spwtagworkbench.backend.host.HostPointResolver
+import io.github.univers629.spwtagworkbench.backend.host.HostVersion
 import io.github.univers629.spwtagworkbench.backend.host.TitlebarDiscovery
 import io.github.univers629.spwtagworkbench.core.Diag
 import io.github.univers629.spwtagworkbench.core.HostLanguage
@@ -62,14 +65,24 @@ class MainPlugin(
     private var titlebarHandle: AutoCloseable? = null
 
     override fun start() {
-        // 先绑定宿主给出的插件 ID：后面所有落数据目录的逻辑都依赖它
-        PluginEnv.bind(pluginContext.pluginId)
+        // 先绑定宿主给出的插件 ID 与宿主版本：后面所有落数据目录、按版本选点位的逻辑都依赖它
+        PluginEnv.bind(
+            pluginId = pluginContext.pluginId,
+            spwVersion = pluginContext.spwVersion,
+            spwChannel = pluginContext.spwChannel.name,
+        )
         L10n.install(HostLanguage.effectiveTag())
         Settings.load()
         // 清掉上次异常退出可能残留的草稿图片临时文件
         io.github.univers629.spwtagworkbench.data.Drafts
             .sweepImageDir()
-        Diag.session("start v=" + pluginContext.pluginVersion + " spw=" + pluginContext.spwVersion + " path=" + pluginContext.pluginPath)
+        Diag.session(
+            "start v=" + pluginContext.pluginVersion +
+                " spw=" + pluginContext.spwVersion +
+                " channel=" + pluginContext.spwChannel.name +
+                " points=" + HostHookPoints.labelOf(HostHookPoints.forVersion(pluginContext.spwVersion)) +
+                " path=" + pluginContext.pluginPath,
+        )
 
         val canHook =
             runCatching {
@@ -129,6 +142,9 @@ class MainPlugin(
         titlebarHandle = null
         // 清空宿主方法绑定：下次启用重新扫描，不复用旧句柄
         TitlebarHost.clear()
+        // 点位解析缓存同理：宿主升级后旧点位会失效，缓存不得跨启用复用
+        navCallerCache = null
+        HostPointResolver.clear()
         // 主动注销宿主导航 hook 与快捷键：句柄一个不漏地关掉
         for (h in navHandles) runCatching { h.close() }
         navHandles.clear()
@@ -161,7 +177,7 @@ class MainPlugin(
             shortcutHandle =
                 WorkshopApi.manager.keyBindingManager.register(
                     actionId = "open-workbench",
-                    title = L10n.t("shortcut.openWorkbench"),
+                    title = L10n.t("shortcut.toggleWorkbench"),
                     defaultShortcut =
                         com.xuncorp.spw.workshop.api.ActionShortcut(
                             java.awt.event.KeyEvent.VK_T,
@@ -170,10 +186,13 @@ class MainPlugin(
                         ),
                     hasGlobal = true,
                 ) {
-                    // 回调可能不在界面线程：切到 EDT 再改 Compose 状态
-                    runCatching { javax.swing.SwingUtilities.invokeLater { openWorkbench() } }
+                    // 回调可能不在界面线程：切到 EDT 再改 Compose 状态。
+                    //
+                    // 走 toggle 而不是 open：快捷键是开关（开 → 关 → 开），
+                    // 与宽视图右上角的关闭按钮形成同一对动作。
+                    runCatching { javax.swing.SwingUtilities.invokeLater { toggleWorkbench() } }
                 }
-            Diag.log("shortcut: 已注册 open-workbench（默认 Ctrl+Alt+T，可在宿主快捷键设置中改键）")
+            Diag.log("shortcut: 已注册 open-workbench（开合工作台，默认 Ctrl+Alt+T，可在宿主快捷键设置中改键）")
         }.onFailure { t ->
             Diag.log("shortcut: 注册失败 ${t.javaClass.simpleName}: ${t.message.orEmpty().take(80)}")
         }
@@ -230,16 +249,20 @@ class MainPlugin(
     private var forceOpaqueByReplace = false
 
     private fun installTopLevelSidebar() {
+        // 层级 A 三点：已测版本直取静态表（零扫描）；未测版本经角色 + 调用点校验，
+        // 不过即返回 null，退回层级 B。不做自动发现（两个候选无原则性判据可区分）。
+        val points = HostPointResolver.resolveTopLevel()
+        if (points == null) {
+            Diag.log("mount: 层级 A 不可用（版本 ${HostVersion.label(pluginContext.spwVersion)}），侧栏使用层级 B")
+            return
+        }
+        val (className, methodName, inClass) = points
         topLevelHandle =
             runCatching {
                 WorkshopApi.hookRegistrar.afterComposable(
-                    // 1.19.2 实测点位：guide §9.2 的 className 写的是 Š(U+0160)，
-                    // 但那个类在 1.19.2 是死代码（全 JAR 无一引用）。
-                    // 真正持有顶层 Composable 的是 К(U+041A)——MainSurface 的实现类，
-                    // 常量池验证 ѐ 对 К.Ϳ 有且仅有 1 个调用点（偏移 179）。
-                    className = "androidx.compose.ui.\u041A",
-                    methodName = "\u037F",
-                    inClass = "androidx.compose.ui.\u0450",
+                    className = className,
+                    methodName = methodName,
+                    inClass = inClass,
                     parameterTypes = null,
                 ) {
                     io.github.univers629.spwtagworkbench.ui.sidebar
@@ -297,7 +320,7 @@ class MainPlugin(
                 WorkshopApi.hookRegistrar.afterComposable(
                     className = NAV_CLASS,
                     methodName = NAV_METHOD,
-                    inClass = NAV_CALLER,
+                    inClass = navCaller(),
                     parameterTypes = null,
                 ) {
                     PluginOverlay()
@@ -317,7 +340,7 @@ class MainPlugin(
                 WorkshopApi.hookRegistrar.replaceComposable(
                     className = NAV_CLASS,
                     methodName = NAV_METHOD,
-                    inClass = NAV_CALLER,
+                    inClass = navCaller(),
                     parameterTypes = null,
                 ) {
                     HostPassthrough()
@@ -429,17 +452,33 @@ class MainPlugin(
         private const val NAV_METHOD = "AppNavigation"
 
         /**
-         * AppNavigation 的实际调用方所在类（Compose 混淆名）。
+         * 层级 B 的 `inClass`（`AppNavigation` 的实际调用方，Compose 混淆名）。
          *
-         * 这个值**宿主每次发版都可能变**，是升级后最需要重新定位的点位。
-         * 1.19.0 = `androidx.compose.ui.\u06C4`（阿拉伯字母）
-         * 1.19.1 = `androidx.compose.ui.\u0443`（西里尔字母 у）
+         * **只在首次需要时解析一次**，之后缓存 —— Hook 注册会调用两次
+         * （append 与 replace），而未知版本可能触发一次约 1.4 秒的字节码扫描。
          *
-         * 定位方法见 `宿主点位提取方法论.md` §6 Step 4b：
-         * 在宿主 JAR 里找常量池 Methodref 真正 invoke 了
-         * `AppNavigationKt.AppNavigation` 的那个类。
+         * 取值路径见 [HostPointResolver]：
+         * 已知版本直接用静态表（零开销）；未知版本先校验静态值，
+         * 校验不过再结构发现「唯一 invoke AppNavigationKt.AppNavigation 的外部类」。
+         *
+         * 缓存的生命周期与插件一致，在 [stop] 里由 [HostPointResolver.clear] 清掉：
+         * 宿主升级后旧点位会失效，缓存只会让下次启用用一个已经不对的值。
          */
-        private const val NAV_CALLER = "androidx.compose.ui.\u0443"
+        @Volatile
+        private var navCallerCache: String? = null
+
+        /**
+         * 解析（或取缓存的）层级 B `inClass`。
+         *
+         * 解析失败时返回空串：调用方仍会注册，由 Hook 框架报错并走既有降级路径 ——
+         * 比在这里提前放弃更接近原有行为。
+         */
+        private fun navCaller(): String =
+            navCallerCache
+                ?: synchronized(this) {
+                    navCallerCache
+                        ?: HostPointResolver.resolveNavCaller().orEmpty().also { navCallerCache = it }
+                }
 
         /** 每轮等宿主调用替换体的时长。留足首帧时间，避免误判。 */
         private const val REPLACE_WAIT_MS = 3_000L
@@ -458,10 +497,27 @@ class MainPlugin(
          */
         private const val TITLEBAR_DISCOVERY_TIMEOUT_MS = 12_000L
 
-        /** 设置页按钮入口。 */
+        /**
+         * 设置页按钮入口：**只打开**，不收起。
+         *
+         * 设置页那一项写的是「打开音乐标签工作台」，语义是跳转过去；
+         * 在这里做成开关会让「点按钮反而关掉」不符合按钮文案。
+         */
         @JvmStatic
         fun openWorkbench() {
             SpaceRouter.open(SpacePage.Desk)
+        }
+
+        /**
+         * 快捷键入口：**开合**工作台。
+         *
+         * 与 [openWorkbench] 分开，是因为两个入口的语义不同：
+         * 快捷键是一对动作（按一次开、再按关），设置页按钮是单向跳转。
+         * 收起走的是宽视图右上角关闭按钮的同一条路径。
+         */
+        @JvmStatic
+        fun toggleWorkbench() {
+            SpaceRouter.toggle(SpacePage.Desk)
         }
 
         /** 设置页「快捷键设置」入口：宿主的快捷键管理页由用户侧打开，这里给出路径提示。 */
