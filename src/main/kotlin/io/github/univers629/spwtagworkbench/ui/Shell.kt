@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
@@ -139,6 +140,23 @@ fun HostPassthrough() {
     // 所以只记次数；组合真出错时宿主会吞掉异常，看门狗看到「进过组合但没存活」
     // 就按失败处理。
     ShellState.replaceInvocations += 1
+
+    // 声明「宿主内容已由替换体接管」——透明底的判据之一。
+    // 用 DisposableEffect 而不是裸赋值：离开组合时清位，
+    // 于是宿主不再调用替换体后，配色自动退回不透明，不会留下
+    // 「宿主内容重新可见、插件页面仍是透明」的重叠状态。
+    //
+    // 起止都记日志：重叠只发生在「宿主内容可见」与「页面已透明」两者并存的窗口里，
+    // 事后要靠这两行才能判断当时是否真的接管住了。
+    DisposableEffect(Unit) {
+        ShellState.hostContentTakenOver = true
+        Diag.log("material: 宿主内容已接管（展开时隐藏，页面可透明）")
+        onDispose {
+            ShellState.hostContentTakenOver = false
+            Diag.log("material: 宿主内容不再接管（页面转不透明，宿主恢复自绘）")
+        }
+    }
+
     RetainedHostContent(hidden = ShellState.onScreen) { AppNavigation() }
     // 存活标记放在最后：整个组合体走完才置位。
     // 中途抛异常则不置位，看门狗会关掉替换、让宿主自绘。
@@ -159,10 +177,22 @@ fun HostPassthrough() {
 internal fun rememberHostPalette(): Palette {
     val dark = remember(ShellState.open) { guardHost("dark") { Host.detectDark() } ?: true }
     val style = remember(ShellState.open) { guardHost("style") { Host.windowStyle } ?: "None" }
-    // forceOpaque 必须进 key：替换失败回退时它会被改写，不进 key 调色板不会重算
-    return remember(dark, style, Settings.forceOpaque) {
+    // 两个 key 都必须进 remember：
+    // - forceOpaque：替换失败回退时被改写
+    // - hostContentTakenOver：替换体是否真的在接管（见下）
+    val takenOver = ShellState.hostContentTakenOver
+    return remember(dark, style, Settings.forceOpaque, takenOver) {
         guardHost("palette") {
-            saltPalette(dark = dark, windowStyle = style, forceOpaque = Settings.forceOpaque)
+            saltPalette(
+                dark = dark,
+                windowStyle = style,
+                forceOpaque = Settings.forceOpaque,
+                // 透明底**只在宿主内容确实被替换体接管时**成立：
+                // 托管中 → 展开时宿主内容被隐藏，透明只透出 DWM 材质；
+                // 未托管 → 宿主仍在自绘，透明会让两套界面叠在一起互相穿透。
+                // 只看 windowStyle 不够：材质可用不等于替换体接管成功。
+                hostContentTakenOver = takenOver,
+            )
         } ?: saltPalette(dark = true, windowStyle = "None", forceOpaque = true)
     }
 }
@@ -174,11 +204,13 @@ fun PluginOverlay() {
     // 日志面板的显示状态。用 remember 而非 ShellState：它只是浮层里的一层遮罩
     var logOpen by remember { mutableStateOf(false) }
     val onScreen = ShellState.onScreen
-    Diag.logOnce(
-        "shell-compose",
-        "PluginOverlay composed material=${palette.material} dark=${palette.dark} " +
+    // 按值变化记录，而不是 logOnce：logOnce 只看首个值，
+    // 而「接管成功 → 页面由不透明转透明」这个转场正是要观察的对象。
+    Diag.logOnChange(
+        key = "shell-material",
+        value = "material=${palette.material} takenOver=${ShellState.hostContentTakenOver} " +
             "forceOpaque=${Settings.forceOpaque}",
-    )
+    ) { v -> "PluginOverlay $v" }
 
     CompositionLocalProvider(
         LocalPalette provides palette,

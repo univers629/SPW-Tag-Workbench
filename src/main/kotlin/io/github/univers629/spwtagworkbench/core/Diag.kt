@@ -31,6 +31,9 @@ object Diag {
             f.parentFile?.mkdirs()
             f.appendText("\n===== $header @ ${LocalTime.now().format(timeFmt)} =====\n")
         }
+        // 新会话重置转场记忆：同一进程内重新启用插件时，首个值要能记下来
+        resetOnChange()
+        synchronized(once) { once.clear() }
     }
 
     fun log(message: String) {
@@ -49,6 +52,33 @@ object Diag {
         message: String,
     ) {
         if (once.add(key)) log(message)
+    }
+
+    /** 上次记录过的值，供 [logOnChange] 比对。 */
+    private val lastValue = mutableMapOf<String, Any?>()
+
+    /**
+     * 值**发生变化**时才记一行。首次调用即记录。
+     *
+     * 用于状态转场：这类事件按帧求值，直接 log 会刷屏，而 [logOnce] 又只能看首个值，
+     * 转场（如「不透明 → 透明」）反而看不到。
+     */
+    fun logOnChange(
+        key: String,
+        value: Any?,
+        message: (Any?) -> String,
+    ) {
+        synchronized(lastValue) {
+            val previous = lastValue[key]
+            if (previous == value && lastValue.containsKey(key)) return
+            lastValue[key] = value
+        }
+        log(message(value))
+    }
+
+    /** 清掉 [logOnChange] 的记忆，使下次调用必定记录。 */
+    private fun resetOnChange() {
+        synchronized(lastValue) { lastValue.clear() }
     }
 
     /**
@@ -83,7 +113,8 @@ object Diag {
         val f = file ?: return
         runCatching {
             f.writeText("")
-            once.clear()
+            synchronized(once) { once.clear() }
+            resetOnChange()
         }
     }
 }

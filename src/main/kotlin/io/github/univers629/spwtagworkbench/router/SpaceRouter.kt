@@ -164,6 +164,21 @@ object ShellState {
     @Volatile
     var replaceError: String? = null
 
+    /**
+     * 宿主内容此刻是否**真的**由替换体接管（即替换体正在组合中）。
+     *
+     * 这是透明底的安全前提：替换体接管后，宿主内容由 `RetainedHostContent` 决定放不放置，
+     * 宽视图展开时把它隐藏，透明才只透出 DWM 材质。若替换体没接管，
+     * 宿主仍在自绘自己的界面，而插件页面是全透明的 —— 两边叠在一起，
+     * 插件控件与宿主控件互相穿透。
+     *
+     * 与 [replaceAlive] 的区别：那个是「曾经成功过」的跨线程存活信号（`@Volatile`，
+     * 供看门狗判定），本字段是「此刻仍在接管」的 Compose 状态，**驱动配色**。
+     * 由 `HostPassthrough` 在进入组合时置位、离开组合时清位，
+     * 因此宿主停止调用替换体后会自动退回不透明。
+     */
+    var hostContentTakenOver by mutableStateOf(false)
+
     fun reset() {
         open = false
         progress = 0f

@@ -316,13 +316,22 @@ val Salt: Palette @Composable get() = LocalPalette.current
  * 按宿主窗口材质与深浅取色板。
  *
  * @param windowStyle 宿主 SpwWindowStyle 的名字；"None" 表示材质不可用
+ * @param forceOpaque 替换失败后强制不透明（看门狗置位）
+ * @param hostContentTakenOver 宿主内容此刻是否由替换体接管。
+ *
+ * 材质配方（[darkMaterial] 等）的页面底是 [Color.Transparent]，**只在宿主内容
+ * 由替换体接管时**才是对的：那时展开宽视图会把宿主内容隐藏，透明就只透出 DWM 材质。
+ * 若替换体尚未接管或已被关闭，宿主仍在自绘自己的界面，而插件页面是全透明的，
+ * 两套界面会叠在一起、控件互相穿透。因此这里必须要求
+ * `hostContentTakenOver`，不能只看 `windowStyle`。
  */
 fun saltPalette(
     dark: Boolean,
     windowStyle: String,
     forceOpaque: Boolean = false,
+    hostContentTakenOver: Boolean = false,
 ): Palette {
-    val material = !forceOpaque && windowStyle != "None"
+    val material = !forceOpaque && windowStyle != "None" && hostContentTakenOver
     if (!material) return if (dark) darkSolid else lightSolid
     if (dark) return darkMaterial
     return if (windowStyle.startsWith("WindowsMica")) lightMica else lightAcrylic
