@@ -61,6 +61,32 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
 /**
+ * 切歌时是否把展示内容（歌词 / 封面 / 频谱）切到新曲目。
+ *
+ * 三种情况跟随：用户没点选过（焦点一直在跟随播放）、焦点为空、新曲目就是当前焦点。
+ * 用户点选了别的歌时**不跟随** —— 展示内容属于 [Repo.focused]，换掉会让元数据
+ * 是一首、封面与歌词是另一首。
+ *
+ * @param focusedKey 当前焦点曲目的 [TrackMeta.key]；无焦点时为 null
+ */
+internal fun shouldFollowPlayingTrack(
+    userPicked: Boolean,
+    focusedKey: String?,
+    incomingKey: String,
+): Boolean = !userPicked || focusedKey == null || focusedKey == incomingKey
+
+/**
+ * 曲库加载完成时是否用第一首作兜底焦点。
+ *
+ * 仅在用户从未点选、且当前没有焦点时使用。直接写兜底项会让它变成实质选择，
+ * 之后不再跟随正在播放。
+ */
+internal fun shouldUseLibraryFallback(
+    userPicked: Boolean,
+    focusedKey: String?,
+): Boolean = !userPicked && focusedKey == null
+
+/**
  * 插件的数据中枢。
  *
  * 所有异步任务都带一个 epoch 令牌：切歌、换页、重新发起任务都会让旧令牌过期，
@@ -249,6 +275,16 @@ object Repo {
     var library by mutableStateOf<List<TrackMeta>>(emptyList())
         private set
     var selected by mutableStateOf<TrackMeta?>(null)
+        private set
+
+    /**
+     * 用户是否在曲库里显式点选过曲目。
+     *
+     * [selected] 同时承担「用户选定」与「兜底默认项」两种角色：曲库加载完成、
+     * 元数据回读都会写它。只看 [selected] 是否为空区分不出用户意图，会把焦点
+     * 钉在兜底项上、不再跟随正在播放。本字段只由 [select] 置位。
+     */
+    var userPicked by mutableStateOf(false)
         private set
     var libraryLoading by mutableStateOf(false)
         private set
@@ -535,6 +571,15 @@ object Repo {
      */
     var cover by mutableStateOf<ImageBitmap?>(null)
 
+    /**
+     * [cover] 这张图属于哪首曲目（[TrackMeta.key]）。
+     *
+     * 封面是全局单值，而界面聚焦的曲目由 [focused] 决定，两者可能短暂不同步：
+     * 加载是异步的，切歌瞬间还会残留上一张。渲染方用本字段判断这张图是否属于
+     * 当前曲目，不属于就不画 —— 否则会出现「字段是一首、封面是另一首」。
+     */
+    var coverOwner by mutableStateOf("")
+
     var candidates by mutableStateOf<List<CoverCandidate>>(emptyList())
 
     /**
@@ -804,7 +849,11 @@ object Repo {
                 // 停用场景不需要 token：shutdown 里 scope.cancel() 已把本协程取消。
                 if (result != null) {
                     library = result.map { it.toMeta() }
-                    if (selected == null) selected = library.firstOrNull()
+                    // 兜底默认项：只在用户没点选过、当前也没有焦点时用曲库第一首。
+                    // 直接写 selected 会把焦点钉在它上面，之后不再跟随播放。
+                    if (shouldUseLibraryFallback(userPicked, selected?.key)) {
+                        library.firstOrNull()?.let { applyFocus(it) }
+                    }
                     // 曲库里没有时至少保留当前播放
                     if (library.isEmpty() && track.isPresent) library = listOf(track)
                 } else {
@@ -837,7 +886,16 @@ object Repo {
                 )
             return
         }
-        Epoch.invalidateAll()
+        // 展示内容（歌词 / 封面 / 频谱）属于 [focused]，不属于正在播放的曲目。
+        // 用户从曲库手选了别的歌时，切歌不替换这份内容 —— 否则元数据是一首、
+        // 封面与歌词是另一首。相应地也不作废它进行中的加载与在线匹配。
+        //
+        // 跟随播放时走 [applyFocus]：它维护 selected 与展示内容的一致性，
+        // 且不置位 userPicked —— 焦点仍是「跟随」，下一次切歌继续更新。
+        val followsPlaying = shouldFollowPlayingTrack(userPicked, selected?.key, meta.key)
+        if (followsPlaying) {
+            applyFocus(meta)
+        }
         track = meta
         PlaybackSignal.currentId = meta.id
         PlaybackSignal.currentPath = meta.path
@@ -848,28 +906,10 @@ object Repo {
         hasPosition = false
         lastPublishedMs = -1L
         currentLine = -1
-        lines = emptyList()
-        editedLines = emptyList()
-        lyricBase = ""
-        lyricText = ""
-        lyricSource = ""
-        cover = null
-        clearCandidates()
-        spectrum = SpectrumState.Idle
-        // 艺术家候选同样属于上一首，不清会残留在新歌的封面上
-        artistCandidate = null
-        artistSlots = listOf(null, null)
-        networkCovers = emptyList()
-        networkArtistCovers = emptyList()
-        // 切歌：正在渲染的频谱作废，旧结果不能留在新歌上
-        Spectrogram.cancel()
-        spectrogram = SpectrogramState.Idle
-        if (selected == null || selected?.key == meta.key) selected = meta
-        loadLyrics(meta)
-        loadCovers(meta)
         // 宿主 MediaItem 只带曲库字段，音轨号 / 碟号 / 作词 / 作曲 / 注释 / ReplayGain
-        // 只有文件里有。切歌后补读一次，否则元数据区这几行会一直是空的。
-        if (meta.hasFile) {
+        // 只有文件里有。跟随播放时 [applyFocus] 已经补读过一次；不跟随时
+        // 仍要读一次，用于刷新曲库列表里那一行与 [track] 的字段。
+        if (!followsPlaying && meta.hasFile) {
             scope.launch { refreshFocusedFromDisk(meta, reloadContent = false) }
         }
     }
@@ -935,19 +975,35 @@ object Repo {
     }
     // ── 选择 ────────────────────────────────────────────────────────────────
 
-    /** 把编辑焦点对齐到正在播放的曲目（打开宽视图时用）。 */
+    /**
+     * 用户从未手选过曲目时，把编辑焦点对到当前曲目。
+     *
+     * 手选过就以用户的选择为准：主视图的元数据、封面、歌词三者都跟随
+     * [focused]，强制改回播放曲会让元数据与封面歌词指向不同曲目。
+     */
     fun focusPlaying() {
+        if (userPicked) return
         val playing = track
         if (playing.isPresent) {
-            select(playing)
+            if (selected?.key != playing.key) applyFocus(playing)
         } else {
-            if (selected == null) {
-                library.firstOrNull()?.let { select(it) }
-            }
+            library.firstOrNull()?.let { applyFocus(it) }
         }
     }
 
+    /** 用户在曲库里点选曲目：这是唯一会置位 [userPicked] 的入口。 */
     fun select(meta: TrackMeta) {
+        userPicked = true
+        applyFocus(meta)
+    }
+
+    /**
+     * 把编辑焦点与展示内容（歌词 / 封面 / 频谱）切到 [meta]。
+     *
+     * 内部对齐（曲库兜底、切歌跟随、元数据回读）只改焦点，不改变用户意图；
+     * 用户点选走 [select]。
+     */
+    private fun applyFocus(meta: TrackMeta) {
         if (selected?.key == meta.key) {
             // 同一首再次选中：宿主的 meta 可能缺文件独有字段（音轨号 / 作词 /
             // 注释 / ReplayGain），补读一次，避免这几行停在空值上。
@@ -956,6 +1012,12 @@ object Repo {
             }
             return
         }
+        // 焦点与播放曲目可能不同（用户从曲库选了别的歌）。
+        // 记录两者的 key 前缀，用于判断三者是否同曲。
+        Diag.log(
+            "focus: -> ${meta.key.take(12)} userPicked=$userPicked " +
+                "playing=${track.key.take(12)} same=${meta.key == track.key}",
+        )
         selected = meta
         Epoch.invalidateAll()
         lines = emptyList()
@@ -964,6 +1026,7 @@ object Repo {
         lyricText = ""
         lyricSource = ""
         cover = null
+        coverOwner = ""
         clearCandidates()
         spectrum = SpectrumState.Idle
         // 测量结果与「文件里已有的增益」都属于上一首，不清会显示成新歌的
@@ -999,6 +1062,16 @@ object Repo {
 
     /** 当前界面聚焦的曲目：优先用户手选，否则跟随正在播放。 */
     fun focused(): TrackMeta = selected ?: track
+
+    /**
+     * [cover] 是否属于界面当前聚焦的曲目。
+     *
+     * 界面渲染封面时必须先过这一关：封面是全局单值、异步加载，
+     * 与 [focused] 存在不同步的窗口。不过这一关就会出现
+     * 「元数据是一首、封面是另一首」。
+     */
+    fun coverBelongsToFocused(): Boolean =
+        cover != null && coverOwner == focused().key
 
     // ── 歌词 ────────────────────────────────────────────────────────────────
     fun loadLyrics(meta: TrackMeta) {
@@ -1294,6 +1367,7 @@ object Repo {
         // 只负责"当前封面"的展示。本地/同目录候选逻辑已取消：// 候选区只显示网络多源结果。
         if (meta.path.isBlank()) {
             cover = null
+            coverOwner = meta.key
             coverLoading = false
             artistSlots = listOf(null, null)
             selectedCoverId = null
@@ -1313,6 +1387,7 @@ object Repo {
                 coverLoading = false
                 if (!Epoch.coverAlive(token)) return@withContext
                 cover = image
+                coverOwner = meta.key
                 localCoverInfo = coverInfo
                 artistSlots = slots
             }
@@ -1649,6 +1724,7 @@ object Repo {
     ) {
         Drafts.stageCover(meta.key, bytes)
         cover = image
+        coverOwner = meta.key
         localCoverInfo = infoOf(bytes)
         val key = meta.key
         val gen = ++coverPreviewGen
@@ -3295,7 +3371,9 @@ object Repo {
                 readable = true,
             )
         withContext(Dispatchers.Main) {
-            if (focused().key == meta.key) {
+            // 只刷新已有焦点的字段：selected 为 null 时焦点在 [track] 上，
+            // 这里写 selected 会把兜底焦点变成实质选择，之后不再跟随播放。
+            if (selected != null && selected?.key == meta.key) {
                 selected = updated
                 if (reloadContent) {
                     loadLyrics(updated)

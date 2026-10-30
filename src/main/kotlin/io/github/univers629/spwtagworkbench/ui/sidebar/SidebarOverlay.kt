@@ -177,11 +177,11 @@ private fun SidebarContent() {
     val palette = Salt
     val open = SidebarUi.open
 
-    // 打开面板时若还没封面，立即补一次（不依赖之前是否加载成功）
+    // 打开面板时若封面不属于当前曲目，补一次（不依赖之前是否加载成功）
     androidx.compose.runtime.LaunchedEffect(open) {
         if (open) {
-            val meta = if (Repo.track.isPresent) Repo.track else Repo.focused()
-            if (Repo.cover == null && meta.path.isNotBlank()) Repo.loadCovers(meta)
+            val meta = Repo.focused()
+            if (!Repo.coverBelongsToFocused() && meta.path.isNotBlank()) Repo.loadCovers(meta)
         }
     }
     // 宽视图展开过程中侧栏本体淡出，不跟着缩放
@@ -243,8 +243,9 @@ private fun SidebarPanel(
     // 半透明底在 Win11 材质下与背后内容重叠，所以用浮层那套校准过的实色底，
     // 只是把不透明度从 90% 降到 75%，让材质透出来一些。
     val palette = Salt.sidebarSolid
-    val track = Repo.track
-    val original = if (track.isPresent) track else Repo.focused()
+    // 与主视图同源：侧栏的封面、文字、歌词都取聚焦曲目，不单独跟随播放曲目。
+    // 后者会让文字是播放曲、封面是曲库所选，两块内容对不上。
+    val original = Repo.focused()
     // 预览制：显示草稿合成后的值
     val meta = Drafts.merge(original)
     // 有未保存改动的字段：与主视图一样在标签前加圆点

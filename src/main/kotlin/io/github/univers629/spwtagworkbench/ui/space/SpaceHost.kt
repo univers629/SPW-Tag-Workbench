@@ -487,7 +487,8 @@ internal fun CoverThumb(
     radius: Dp = 12.dp,
 ) {
     val pal = Salt
-    val image = Repo.cover
+    // 只画属于当前聚焦曲目的那张：封面是全局单值，切歌后可能残留上一首
+    val image = if (Repo.coverBelongsToFocused()) Repo.cover else null
     Box(
         modifier =
             Modifier

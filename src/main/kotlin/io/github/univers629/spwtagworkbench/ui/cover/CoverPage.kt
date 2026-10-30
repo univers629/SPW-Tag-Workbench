@@ -104,7 +104,8 @@ fun CoverPage(interactive: Boolean) {
                             .border(0.5.dp, palette.border, RoundedCornerShape(14.dp)),
                     contentAlignment = Alignment.Center,
                 ) {
-                    val local = Repo.cover
+                    // 只画属于当前聚焦曲目的那张：封面是全局单值，切歌后会残留上一首
+                    val local = if (Repo.coverBelongsToFocused()) Repo.cover else null
                     if (local != null) {
                         Image(
                             bitmap = local,

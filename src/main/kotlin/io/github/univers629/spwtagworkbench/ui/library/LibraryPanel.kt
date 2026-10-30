@@ -120,7 +120,8 @@ fun LibraryPanel(
                 tokens.all { haystack.contains(it.lowercase()) }
             }
         }
-    val selectedKey = (Repo.selected ?: Repo.track).key
+    // 与主视图同源：高亮的是当前聚焦曲目，而不是兜底的 selected
+    val selectedKey = Repo.focused().key
 
     // 内嵌但不铺满：四周留距、四角圆角，像一张浮起来的卡片
     Column(
