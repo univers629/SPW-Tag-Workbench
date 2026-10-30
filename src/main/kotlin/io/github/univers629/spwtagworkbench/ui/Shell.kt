@@ -177,21 +177,13 @@ fun HostPassthrough() {
 internal fun rememberHostPalette(): Palette {
     val dark = remember(ShellState.open) { guardHost("dark") { Host.detectDark() } ?: true }
     val style = remember(ShellState.open) { guardHost("style") { Host.windowStyle } ?: "None" }
-    // 两个 key 都必须进 remember：
-    // - forceOpaque：替换失败回退时被改写
-    // - hostContentTakenOver：替换体是否真的在接管（见下）
-    val takenOver = ShellState.hostContentTakenOver
-    return remember(dark, style, Settings.forceOpaque, takenOver) {
+    // forceOpaque 必须进 key：替换体组合中途抛异常时它会被看门狗改写
+    return remember(dark, style, Settings.forceOpaque) {
         guardHost("palette") {
             saltPalette(
                 dark = dark,
                 windowStyle = style,
                 forceOpaque = Settings.forceOpaque,
-                // 透明底**只在宿主内容确实被替换体接管时**成立：
-                // 托管中 → 展开时宿主内容被隐藏，透明只透出 DWM 材质；
-                // 未托管 → 宿主仍在自绘，透明会让两套界面叠在一起互相穿透。
-                // 只看 windowStyle 不够：材质可用不等于替换体接管成功。
-                hostContentTakenOver = takenOver,
             )
         } ?: saltPalette(dark = true, windowStyle = "None", forceOpaque = true)
     }
@@ -204,12 +196,16 @@ fun PluginOverlay() {
     // 日志面板的显示状态。用 remember 而非 ShellState：它只是浮层里的一层遮罩
     var logOpen by remember { mutableStateOf(false) }
     val onScreen = ShellState.onScreen
-    // 按值变化记录，而不是 logOnce：logOnce 只看首个值，
-    // 而「接管成功 → 页面由不透明转透明」这个转场正是要观察的对象。
+    // 宽视图与宿主内容互斥：展开时宿主内容由替换体隐藏，宽视图画在透明底上。
+    // 替换体未接管就渲染宽视图，透明页面会盖在仍然可见的宿主内容上，两套界面叠在一起。
+    // 页面本身不透明时（无窗口材质、或替换体已确认失败）不需要这个前提：
+    // 实色底已经盖住宿主内容。
+    val canPresent = !palette.material || ShellState.hostContentTakenOver
+    // 按值变化记录：接管转场与可呈现条件都要能看到
     Diag.logOnChange(
-        key = "shell-material",
+        key = "shell-presentable",
         value = "material=${palette.material} takenOver=${ShellState.hostContentTakenOver} " +
-            "forceOpaque=${Settings.forceOpaque}",
+            "forceOpaque=${Settings.forceOpaque} canPresent=$canPresent",
     ) { v -> "PluginOverlay $v" }
 
     CompositionLocalProvider(
@@ -227,7 +223,8 @@ fun PluginOverlay() {
                     .fillMaxSize()
                     .then(pageBackground(onScreen, palette)),
         ) {
-            if (ShellState.open || onScreen) {
+            // 不可呈现时宽视图不进入组合：半透明界面不能叠在仍然可见的宿主内容上。
+            if (canPresent && (ShellState.open || onScreen)) {
                 WideView(onOpenLog = { logOpen = true })
             }
 
