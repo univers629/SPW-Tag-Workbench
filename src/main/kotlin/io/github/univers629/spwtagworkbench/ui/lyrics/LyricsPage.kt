@@ -39,6 +39,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.univers629.spwtagworkbench.backend.source.GroupedCandidate
+import io.github.univers629.spwtagworkbench.backend.source.flattenLyricCandidates
 import io.github.univers629.spwtagworkbench.core.Card
 import io.github.univers629.spwtagworkbench.core.EmptyState
 import io.github.univers629.spwtagworkbench.core.Glyph
@@ -188,7 +189,13 @@ private fun LyricCandidateList(interactive: Boolean) {
 
         is LyricMatch.Done -> {
             val groups = state.groups
-            if (groups.all { it.items.isEmpty() }) {
+            // 不再按源分组：五个源摊平成一张表，同匹配等级内逐字优先。
+            // 每行副标题已带源名，摊平不损失信息；组间顺序（源权重）留作第三层 tie-break。
+            val rows =
+                flattenLyricCandidates(groups) {
+                    Repo.isWordSyncedCandidate(it.candidate.sourceId, it.candidate.remoteId)
+                }
+            if (rows.isEmpty()) {
                 EmptyState(
                     glyph = "♪",
                     title = L10n.t("lyrics.noMatch"),
@@ -198,13 +205,13 @@ private fun LyricCandidateList(interactive: Boolean) {
             } else {
                 // 候选列表要**显式持有滚动状态**：不传 state 时滚动位置不受控，
                 // 新一轮搜索结束后会停在上一次翻到的位置，用户得往上翻才看得到
-                // 排在最前的源（如 QQ 音乐）。这里在结果集变化时滚回顶部。
+                // 排在最前的候选。这里在结果集变化时滚回顶部。
                 val listState = rememberLazyListState()
-                // 用「首条源 + 组数」当信号：只有换了结果集才回顶。
-                // 用整份 groups 当 key 会让点选候选后的重组也回顶，把用户弹走。
-                val resultKey = groups.firstOrNull()?.sourceId to groups.size
+                // 用「源数 + 候选总数」当信号：只有换了结果集才回顶。
+                // 不能用行的顺序当 key：逐字粒度确认后行会重排，滚动位置会被重置。
+                val resultKey = groups.size to rows.size
                 LaunchedEffect(resultKey) {
-                    if (groups.isNotEmpty()) listState.scrollToItem(0)
+                    if (rows.isNotEmpty()) listState.scrollToItem(0)
                 }
                 LazyColumn(
                     state = listState,
@@ -212,21 +219,16 @@ private fun LyricCandidateList(interactive: Boolean) {
                     // 与曲库列表一致：横向 8 / 纵向 4，行间距由每行自身的 1dp padding 提供
                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                 ) {
-                    groups.forEach { group ->
-                        // 上限已在数据层截断（Aggregator.MAX_PER_SOURCE），这里不再重复 take。
-                        // 分组之间不插额外间隔块：原来每个源后加 8dp 空行，列表显得很空；
-                        // 源标签已在每行的副标题里，分组信息不会丢。
-                        items(
-                            items = group.items,
-                            key = { "${group.sourceId}-${it.candidate.remoteId}" },
-                        ) { item ->
-                            CandidateRow(
-                                item = item,
-                                sourceLabel = group.label,
-                                interactive = interactive,
-                                onClick = { Repo.chooseGroupedLyrics(group.sourceId, item.candidate) },
-                            )
-                        }
+                    // 上限已在数据层截断（Aggregator.MAX_PER_SOURCE，按源），这里不再重复 take
+                    items(
+                        items = rows,
+                        key = { "${it.candidate.sourceId}-${it.candidate.remoteId}" },
+                    ) { item ->
+                        CandidateRow(
+                            item = item,
+                            interactive = interactive,
+                            onClick = { Repo.chooseGroupedLyrics(item.candidate.sourceId, item.candidate) },
+                        )
                     }
                 }
             }
@@ -237,7 +239,6 @@ private fun LyricCandidateList(interactive: Boolean) {
 @Composable
 private fun CandidateRow(
     item: GroupedCandidate,
-    sourceLabel: String,
     interactive: Boolean,
     onClick: () -> Unit,
 ) {
@@ -246,8 +247,9 @@ private fun CandidateRow(
     // 与曲库列表（LibraryPanel.LibraryRow）保持同一套视觉：
     // 圆角 9dp、行间 1dp、选中用 selected 底色、两行文本（标题 + 副标题）。
     //
-    // 不再标「逐字 / 逐行」：搜索接口不告诉粒度，猜出来的标记会骗人。
-    // 逐字与否点进去看内容一眼便知（参考项目 Tag-Workbench 也不在列表里标）。
+    // 「逐字」只在**已确认**时标：搜索接口不告诉粒度，没取过词的候选不加标记。
+    // 已确认的来源只有两个：点击候选时取得的歌词，以及逐字能力源的粒度补取
+    // （见 Repo.inspectWordSyncedCandidates）。
     Row(
         modifier =
             Modifier
@@ -270,13 +272,24 @@ private fun CandidateRow(
             Txt(
                 text =
                     buildString {
-                        append(sourceLabel)
+                        append(item.candidate.sourceLabel)
                         append(" · ")
                         append(item.candidate.artist.ifBlank { L10n.t("sidebar.unknownArtist") })
                         if (item.candidate.album.isNotBlank()) append(" · ").append(item.candidate.album)
                     },
                 size = T.micro,
                 color = palette.textTertiary,
+                maxLines = 1,
+            )
+        }
+
+        // 「逐字」：已确认才显示，未确认的候选不加标记
+        if (Repo.isWordSyncedCandidate(item.candidate.sourceId, item.candidate.remoteId)) {
+            Spacer(Modifier.width(8.dp))
+            Txt(
+                text = L10n.t("lyrics.wordSynced"),
+                size = T.micro,
+                color = palette.accent,
                 maxLines = 1,
             )
         }

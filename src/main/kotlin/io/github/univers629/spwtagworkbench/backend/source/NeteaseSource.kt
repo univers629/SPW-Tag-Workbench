@@ -22,7 +22,7 @@ class NeteaseSource : MusicSource {
     override val label: String = "网易云"
 
     override val capabilities: Set<Capability> =
-        setOf(Capability.LYRICAL, Capability.META, Capability.COVER, Capability.ARTIST_COVER)
+        setOf(Capability.LYRICAL, Capability.WORD_SYNCED, Capability.META, Capability.COVER, Capability.ARTIST_COVER)
 
     override val weight: Int = 25
 

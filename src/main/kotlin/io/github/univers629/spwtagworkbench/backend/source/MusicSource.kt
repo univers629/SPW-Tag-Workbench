@@ -19,6 +19,15 @@ enum class Capability {
 
     /** 歌词 */
     LYRICAL,
+
+    /**
+     * 逐字歌词（卡拉OK逐字时间轴）。
+     *
+     * 与 [LYRICAL] 分开声明：能取到歌词 ≠ 能取到逐字。实测 QQ（QRC）与酷狗（KRC）
+     * 每条记录都给逐字，网易云的 yrc 只在部分记录上有，酷我 / LRCLIB 结构上只有逐行。
+     * 声明了它的源才会被粒度补取纳入；未声明的源补取只能得到逐行。
+     */
+    WORD_SYNCED,
 }
 
 /** 搜索输入。 */
@@ -241,6 +250,24 @@ object CandidateScoring {
         query: SearchQuery,
         candidate: SourceCandidate,
     ): Boolean = level(query, candidate) > 0
+
+    /**
+     * 两条候选是不是**同一条录音**：同曲名 + 艺人兼容 + 时长接近。
+     *
+     * 用于跨源去重（同曲被多个源命中）与「同一源里同一首歌的多条记录」的识别。
+     *
+     * 注意：同一条录音的**歌词粒度可能不同**——实测网易云同一首歌有两条
+     * 同名同艺人、时长同为 258834ms 的记录，一条只有 LRC、另一条带 yrc 逐字。
+     * 因此它只能用于识别同一条录音，不能用于排除重复记录。
+     */
+    fun sameRecording(
+        a: SourceCandidate,
+        b: SourceCandidate,
+    ): Boolean {
+        if (Matching.normalizeTitle(a.title) != Matching.normalizeTitle(b.title)) return false
+        if (!artistCompatible(a.artist, b.artist)) return false
+        return Matching.durationMatches(a.durationMs, b.durationMs)
+    }
 }
 
 /**

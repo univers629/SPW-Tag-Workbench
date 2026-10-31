@@ -371,19 +371,10 @@ class Aggregator(
             usable.forEach { source ->
                 launch(Dispatchers.IO) {
                     val outcome = cachedSearch(source, query, SOURCE_TIMEOUT_MS)
-                    val items =
-                        outcome.candidates
-                            .map { candidate ->
-                                GroupedCandidate(
-                                    candidate = candidate,
-                                    level = CandidateScoring.level(query, candidate),
-                                )
-                            }.sortedWith(
-                                compareByDescending<GroupedCandidate> { it.level }
-                                    .thenBy { kotlin.math.abs(it.candidate.durationMs - query.durationMs) },
-                            )
+                    val items = rankGroup(query, outcome.candidates)
                     Diag.log(
                         "grouped-stream: ${source.label} -> ${items.size} 条" +
+                            "（原始 ${outcome.candidates.size}）" +
                             if (outcome.failure.isNotBlank()) "（失败：${outcome.failure}）" else "",
                     )
                     onGroup(
@@ -391,7 +382,8 @@ class Aggregator(
                             sourceId = source.id,
                             label = source.label,
                             weight = source.weight,
-                            items = truncate(items),
+                            // rankGroup 内部已按 MAX_PER_SOURCE 截断，这里不再二次截
+                            items = items,
                             failure = outcome.failure.ifBlank { null },
                         ),
                     )
@@ -475,19 +467,21 @@ class Aggregator(
                     GroupedCandidate(candidate = candidate, level = CandidateScoring.level(query, candidate))
                 }.sortedWith(
                     when (rank) {
-                        GroupRank.TITLE -> compareByDescending<GroupedCandidate> { it.level }
+                        // level 是「越小越可信」（见 [CandidateScoring.level]），
+                        // 所以这里必须**升序**：精确命中的排最前，截断才留得住它。
+                        GroupRank.TITLE -> compareBy<GroupedCandidate> { it.level }
 
                         // 否则「正确艺人的其他歌曲」会被标题更匹配的别人挤掉：
                         // 标题同名的翻唱排在前面，截断到 5 条后真艺人的歌被挤掉。
                         GroupRank.ARTIST ->
                             compareByDescending<GroupedCandidate> {
                                 if (CandidateScoring.artistCompatible(query.artist, it.candidate.artist)) 1 else 0
-                            }.thenByDescending { it.level }
+                            }.thenBy { it.level }
 
                         GroupRank.ALBUM ->
                             compareByDescending<GroupedCandidate> {
                                 if (targetAlbum != null && it.candidate.album == targetAlbum) 1 else 0
-                            }.thenByDescending { it.level }
+                            }.thenBy { it.level }
                     },
                 )
         return SourceGroup(
@@ -582,6 +576,40 @@ class Aggregator(
         }
 
         /**
+         * 组内排序与截断：**只留曲名对得上的，最可信的在前**。
+         *
+         * 旧实现按 [CandidateScoring.level] 降序排，而 level 是「越小越可信」，
+         * 于是每组最前面反而是最不像的几条：实测「晴天」的结果里精确命中（level=1）
+         * 被排到第 5 位之后，被 [MAX_PER_SOURCE] 直接截掉，列表上只剩同专辑的
+         * 其它曲目与翻唱。
+         *
+         * 过滤只按**曲名**：曲名完全对不上的是别的歌，放进歌词候选是有害的
+         * （曲名对不上时选中会载入别的歌的歌词）。艺人 / 时长对不上但曲名对得上的仍然保留 ——
+         * 本地时长可能是错的、源侧艺人可能是合作署名。
+         *
+         * **不做「同录音去重」**：同一条录音在源侧可能有多条记录，而它们的
+         * 歌词粒度可能不同。实测网易云同一首歌有两条同名同艺人、时长同为
+         * 258834ms 的记录，一条只有 LRC、另一条带 yrc 逐字 —— 去重会按顺序
+         * 保留前者、把逐字的记录排除。元数据无法区分两者，因此全部保留。
+         */
+        fun rankGroup(
+            query: SearchQuery,
+            candidates: List<SourceCandidate>,
+            limit: Int = MAX_PER_SOURCE,
+        ): List<GroupedCandidate> {
+            val kept =
+                candidates
+                    .map { GroupedCandidate(candidate = it, level = CandidateScoring.level(query, it)) }
+                    .filter { Matching.titleLevel(query.title, it.candidate.title) > 0 }
+                    .sortedWith(
+                        compareBy<GroupedCandidate> { it.level }
+                            .thenBy { kotlin.math.abs(it.candidate.durationMs - query.durationMs) }
+                            .thenBy { it.candidate.title },
+                    )
+            return if (kept.size <= limit) kept else kept.subList(0, limit)
+        }
+
+        /**
          * 按字段合并：多源命中同一首歌时，逐字段取第一个非空值。
          * 某个源缺专辑不会把别的源给的专辑擦掉。
          */
@@ -613,11 +641,7 @@ class Aggregator(
             val ids: MutableMap<String, String>,
             var weight: Int,
         ) {
-            fun matches(other: SourceCandidate): Boolean {
-                if (Matching.normalizeTitle(candidate.title) != Matching.normalizeTitle(other.title)) return false
-                if (!CandidateScoring.artistCompatible(candidate.artist, other.artist)) return false
-                return Matching.durationMatches(candidate.durationMs, other.durationMs)
-            }
+            fun matches(other: SourceCandidate): Boolean = CandidateScoring.sameRecording(candidate, other)
 
             fun absorb(
                 other: SourceCandidate,
@@ -673,3 +697,26 @@ data class GroupedCandidate(
     val level: Int,
     val sources: List<String> = listOf(candidate.sourceId),
 )
+
+/**
+ * 歌词候选的**扁平**列表：不再按源分组，五个源混在一张表里。
+ *
+ * 排序：匹配等级升序（越小越可信）→ 同等级内逐字优先 → 其余保持传入顺序
+ * （`groups` 已按源权重排好，稳定排序会把它保留成第三层 tie-break）。
+ *
+ * 为什么逐字不放到绝对第一位：逐字只说明**粒度**，不代表是同一首歌。
+ * 让「level 3 的逐字翻唱」盖住「level 1 的逐行原唱」，等于用相关度换粒度。
+ *
+ * `isWordSynced` 只应对**已确认**的候选返回 true：没取过词的一律 false，
+ * 顺序只在确认到逐字时改变，不因推测而调整。
+ */
+fun flattenLyricCandidates(
+    groups: List<SourceGroup>,
+    isWordSynced: (GroupedCandidate) -> Boolean,
+): List<GroupedCandidate> =
+    groups
+        .flatMap { it.items }
+        .sortedWith(
+            compareBy<GroupedCandidate> { it.level }
+                .thenByDescending(isWordSynced),
+        )

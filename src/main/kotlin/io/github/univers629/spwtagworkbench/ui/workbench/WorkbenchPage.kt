@@ -308,8 +308,7 @@ private fun ArtistSlot(
  * 点「写入草稿」换成候选图时同步更新 —— 勾选候选不影响它。
  */
 @Composable
-private fun primaryInfo(): String =
-    if (Repo.coverBelongsToFocused()) Repo.localCoverInfo else L10n.t("workbench.noCover")
+private fun primaryInfo(): String = if (Repo.coverBelongsToFocused()) Repo.localCoverInfo else L10n.t("workbench.noCover")
 
 /**
  * 歌词编辑框：主界面右栏，占满高度，可直接编辑，改动只进草稿。

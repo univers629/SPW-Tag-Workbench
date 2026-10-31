@@ -30,7 +30,7 @@ class KugouSource : MusicSource {
     override val label: String = "酷狗音乐"
 
     override val capabilities: Set<Capability> =
-        setOf(Capability.LYRICAL, Capability.META, Capability.ARTIST_COVER)
+        setOf(Capability.LYRICAL, Capability.WORD_SYNCED, Capability.META, Capability.ARTIST_COVER)
 
     override val weight: Int = 35
 

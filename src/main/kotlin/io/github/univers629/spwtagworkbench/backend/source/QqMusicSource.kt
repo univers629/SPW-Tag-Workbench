@@ -21,7 +21,7 @@ class QqMusicSource : MusicSource {
     override val label: String = "QQ音乐"
 
     override val capabilities: Set<Capability> =
-        setOf(Capability.LYRICAL, Capability.META, Capability.COVER, Capability.ARTIST_COVER)
+        setOf(Capability.LYRICAL, Capability.WORD_SYNCED, Capability.META, Capability.COVER, Capability.ARTIST_COVER)
 
     override val weight: Int = 40
 
@@ -37,7 +37,30 @@ class QqMusicSource : MusicSource {
     /** 歌手图：同一图床，前缀 T001。 */
     private val ARTIST_COVER_HOST = "https://y.gtimg.cn/music/photo_new/T001R1200x1200M000"
 
-    private val searchHeaders = mapOf("Referer" to "https://y.qq.com/")
+    /**
+     * 搜索请求头。
+     *
+     * Mobile 变体（`u6.y.qq.com`）按表单接收，必须声明 `application/x-www-form-urlencoded`
+     * 并带真实的客户端 UA —— 缺 UA 或声明成 JSON 会被风控按异常客户端处理，
+     * 返回 code 2001。因此请求头按变体分别构造，不共用一套。
+     */
+    private val mobileHeaders =
+        mapOf(
+            "Referer" to "https://y.qq.com/",
+            "Origin" to "https://y.qq.com",
+            "User-Agent" to "QQMusic 20080508(android)",
+            "Accept" to "*/*",
+            "Content-Type" to "application/x-www-form-urlencoded",
+        )
+
+    /** Desktop 变体沿用 JSON 提交。 */
+    private val desktopHeaders =
+        mapOf(
+            "Referer" to "https://y.qq.com/",
+            "Origin" to "https://y.qq.com",
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Content-Type" to "application/json",
+        )
 
     private val lyricHeaders =
         mapOf(
@@ -236,7 +259,10 @@ class QqMusicSource : MusicSource {
      *
      * 实测（2026-10）：Lite 方法 29 次全部返回 code 2001（已失效），Desktop 间歇性 2001，
      * Mobile（u6.y.qq.com）在冷却后稳定可用，因此去掉 Lite、Mobile 提到最前。
-     * 2001 是风控信号：收到后进入冷却，期间直接返回空，避免继续抬高请求密度。
+     *
+     * 2001 是风控信号，但**只代表当前入口**：三台主机是独立的接入点，一台被限流时
+     * 其余入口仍可能正常。因此单个入口返回 2001 只跳到下一个入口，全部入口都被限流
+     * 才进入冷却 —— 提前返回会让一次限流等于整次搜索失败。
      */
     private suspend fun qqSearch(keyword: String): QqSearchOutcome {
         val now = System.currentTimeMillis()
@@ -244,13 +270,16 @@ class QqMusicSource : MusicSource {
             Diag.log("qqmusic: 冷却中（剩余 ${(cooldownUntil - now) / 1000}s），跳过检索")
             return QqSearchOutcome(emptyList(), limited = true)
         }
+        // 至少一个入口正常应答（未返回 2001）：说明本源可用，不应进入冷却
+        var served = false
+        var limitedAttempts = 0
         for (attempt in QQ_SEARCH_ATTEMPTS) {
             val body = if (attempt.desktop) qqDesktopBody(keyword) else qqMobileBody(keyword)
             val response =
                 Http.postJson(
                     url = "https://${attempt.host}/cgi-bin/musicu.fcg",
                     body = body,
-                    headers = searchHeaders + mapOf("Content-Type" to "application/json"),
+                    headers = if (attempt.desktop) desktopHeaders else mobileHeaders,
                     timeoutMs = 9000,
                 )
             if (!response.ok) {
@@ -271,14 +300,18 @@ class QqMusicSource : MusicSource {
             val groupCode = (parsed.obj("req_1") ?: parsed.obj("request"))?.num("code")?.toInt()
             val topCode = parsed.num("code")?.toInt()
             if (groupCode == 2001 || topCode == 2001) {
-                cooldownUntil = System.currentTimeMillis() + cooldownMs
-                Diag.log(
-                    "qqmusic: ${attempt.host} ${attempt.label} 被限流（code=2001），" +
-                        "冷却 ${cooldownMs / 1000}s",
-                )
-                return QqSearchOutcome(emptyList(), limited = true)
+                limitedAttempts++
+                Diag.log("qqmusic: ${attempt.host} ${attempt.label} 被限流（code=2001），换下一个入口")
+                continue
             }
+            served = true
             Diag.log("qqmusic: ${attempt.host} ${attempt.label} 返回 0 条")
+        }
+        if (!served && limitedAttempts > 0) {
+            // 所有入口都被限流：此时才值得冷却，避免继续抬高请求密度
+            cooldownUntil = System.currentTimeMillis() + cooldownMs
+            Diag.log("qqmusic: $limitedAttempts 个入口全部被限流，冷却 ${cooldownMs / 1000}s")
+            return QqSearchOutcome(emptyList(), limited = true)
         }
         return QqSearchOutcome(emptyList(), limited = false)
     }

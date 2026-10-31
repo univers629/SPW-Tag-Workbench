@@ -51,6 +51,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -1070,8 +1071,7 @@ object Repo {
      * 与 [focused] 存在不同步的窗口。不过这一关就会出现
      * 「元数据是一首、封面是另一首」。
      */
-    fun coverBelongsToFocused(): Boolean =
-        cover != null && coverOwner == focused().key
+    fun coverBelongsToFocused(): Boolean = cover != null && coverOwner == focused().key
 
     // ── 歌词 ────────────────────────────────────────────────────────────────
     fun loadLyrics(meta: TrackMeta) {
@@ -2705,7 +2705,10 @@ object Repo {
                 lyricBase = text
                 lyricText = text
                 lyricsEpoch++
-                lyricSource = L10n.t("status2.onlineSource", label ?: L10n.t("status2.unknownSource"))
+                // 已取得歌词，粒度无需额外请求：写入来源提示，同时记录该候选
+                val wordSynced = LyricsFormat.isReallyWordSynced(text)
+                lyricSource = onlineSourceLabel(label, wordSynced)
+                recordWordSyncIfOwn(ranked.candidate, label, wordSynced)
                 postStatus(Status(L10n.t("status.onlineLyricsLoaded", label ?: L10n.t("status.unknown")), Status.Kind.Ok))
             }
         }
@@ -3396,6 +3399,123 @@ object Repo {
     var lyricMatch by mutableStateOf<LyricMatch>(LyricMatch.Idle)
         private set
 
+    /**
+     * 已确认**真的带逐字时间**的候选歌词：键 = `源id|remoteId`。
+     *
+     * 搜索接口不告诉粒度，只有取到内容才能判定：QQ 的逐字在 `musicu` 的 QRC 端点、
+     * 酷狗在 KRC、网易云的 yrc 藏在取词响应里。所以这里只记**已确认**的，
+     * 没有记录表示尚未验证，界面不显示标记。
+     */
+    var wordSyncedCandidates by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    /** 已经取过词的候选：逐字与逐行都算，避免同一候选反复补取。 */
+    private val inspectedCandidates = java.util.concurrent.ConcurrentHashMap
+        .newKeySet<String>()
+
+    /** 粒度补取的并发上限：4 条并发，实测 1~2 秒跑完一轮，也远低于源站限流阈值。 */
+    private const val INSPECT_CONCURRENCY = 4
+
+    /** 正在补取的候选，避免并发重复请求。 */
+    private val wordSyncInFlight = java.util.concurrent.ConcurrentHashMap
+        .newKeySet<String>()
+
+    private fun candidateKey(
+        sourceId: String,
+        remoteId: String,
+    ): String = "$sourceId|$remoteId"
+
+    /** 该候选是否已确认带逐字时间（候选行据此显示「逐字」）。 */
+    fun isWordSyncedCandidate(
+        sourceId: String,
+        remoteId: String,
+    ): Boolean = candidateKey(sourceId, remoteId) in wordSyncedCandidates
+
+    /** 记一次取词判定结果。只记确认成功的；逐行也记下来，免得再补取一遍。 */
+    private fun recordWordSync(
+        sourceId: String,
+        remoteId: String,
+        wordSynced: Boolean,
+    ) {
+        val key = candidateKey(sourceId, remoteId)
+        inspectedCandidates += key
+        if (!wordSynced) return
+        if (key in wordSyncedCandidates) return
+        wordSyncedCandidates = wordSyncedCandidates + key
+    }
+
+    /** 来源提示：`在线 · QQ音乐`，确认到逐字时追加 ` · 逐字`。 */
+    private fun onlineSourceLabel(
+        sourceLabel: String?,
+        wordSynced: Boolean,
+    ): String {
+        val base = L10n.t("status2.onlineSource", sourceLabel ?: L10n.t("status2.unknownSource"))
+        return if (wordSynced) "$base · ${L10n.t("lyrics.wordSynced")}" else base
+    }
+
+    /** 只在候选**自己的源**真的供词时记录粒度：回退到别的源时不能记在它头上。 */
+    private fun recordWordSyncIfOwn(
+        candidate: SourceCandidate,
+        returnedLabel: String?,
+        wordSynced: Boolean,
+    ) {
+        val own = sources.firstOrNull { it.id == candidate.sourceId } ?: return
+        if (returnedLabel != null && returnedLabel != own.label) return
+        recordWordSync(candidate.sourceId, candidate.remoteId, wordSynced)
+    }
+
+    /**
+     * 把「声明了逐字能力」的源的候选逐条补取，确认真实粒度。
+     *
+     * 只补声明了该能力的源：酷我 / LRCLIB 结构上没有逐字端点，补取只能得到逐行；
+     * QQ（QRC）、酷狗（KRC）、网易云（yrc）有逐字端点。
+     *
+     * 成本：每源最多 `Aggregator.MAX_PER_SOURCE` 条，三个源合计 ≤ 15 次；
+     * 单条实测 QQ ~150ms / 酷狗 ~400ms / 网易云 ~50ms，4 条并发约 1~2 秒。
+     * 在列表上屏之后跑，不阻塞首屏；判定过的候选记在 [inspectedCandidates]，
+     * 重新搜索或切换曲目后不再重复请求。
+     */
+    private fun inspectWordSyncedCandidates(
+        groups: List<SourceGroup>,
+        token: Int,
+    ) {
+        val targets =
+            groups
+                .filter { group -> sources.firstOrNull { it.id == group.sourceId }?.supports(Capability.WORD_SYNCED) == true }
+                .flatMap { group -> group.items.map { group.sourceId to it.candidate } }
+                .filter { (sourceId, candidate) -> candidateKey(sourceId, candidate.remoteId) !in inspectedCandidates }
+                .distinctBy { (sourceId, candidate) -> candidateKey(sourceId, candidate.remoteId) }
+        if (targets.isEmpty()) return
+        Diag.log("word-sync: 补取 ${targets.size} 条候选的歌词粒度")
+        val permits = Semaphore(INSPECT_CONCURRENCY)
+        scope.launch {
+            coroutineScope {
+                targets
+                    .map { (sourceId, candidate) ->
+                        async {
+                            val key = candidateKey(sourceId, candidate.remoteId)
+                            if (!wordSyncInFlight.add(key)) return@async
+                            try {
+                                val source = sources.firstOrNull { it.id == sourceId } ?: return@async
+                                val text =
+                                    permits.withPermit {
+                                        runCatching { source.lyrics(candidate) }.getOrNull()
+                                    } ?: return@async
+                                val wordSynced = LyricsFormat.isReallyWordSynced(text)
+                                withContext(Dispatchers.Main) {
+                                    // 切歌 / 重新搜索后旧结果作废
+                                    if (!Epoch.onlineAlive(token)) return@withContext
+                                    recordWordSync(sourceId, candidate.remoteId, wordSynced)
+                                }
+                            } finally {
+                                wordSyncInFlight.remove(key)
+                            }
+                        }
+                    }.awaitAll()
+            }
+        }
+    }
+
     /** 搜索在线歌词候选（只要声明了 LYRICAL 能力的源）。 */
     fun searchLyrics() {
         val meta = focused()
@@ -3416,10 +3536,12 @@ object Repo {
                 collected += group
                 withContext(Dispatchers.Main) {
                     if (!Epoch.onlineAlive(token)) return@withContext
-                    // 每组一回来就重排一次：组间按源权重，组内已按匹配等级排好
+                    // 每组一回来就上屏一次：组间按源权重排，界面再把它们摊平成一张表
                     val snapshot =
                         collected.toList().sortedWith(compareByDescending<SourceGroup> { it.weight })
                     lyricMatch = LyricMatch.Done(snapshot)
+                    // 列表先上屏，再补取「可能逐字」的候选粒度（后台跑，不阻塞首屏）
+                    inspectWordSyncedCandidates(snapshot, token)
                     val total = snapshot.sumOf { it.items.size }
                     postStatus(
                         Status(
@@ -3496,7 +3618,10 @@ object Repo {
                 lyricBase = text
                 lyricText = text
                 lyricsEpoch++
-                lyricSource = L10n.t("status2.onlineSource", label ?: L10n.t("status2.unknownSource"))
+                // 已取得歌词，粒度无需额外请求：写入来源提示，同时记录该候选
+                val wordSynced = LyricsFormat.isReallyWordSynced(text)
+                lyricSource = onlineSourceLabel(label, wordSynced)
+                recordWordSyncIfOwn(candidate, label, wordSynced)
                 postStatus(
                     Status(
                         text = L10n.t("status2.lyricsLoaded", label ?: L10n.t("status.unknown"), parsed.size),
